@@ -19,8 +19,8 @@ if (!mongoUri || !process.env.JWT_SECRET) {
 
 app.use(cors());
 // Profile photos are stored as data URLs for the local prototype. Allow the
-// 1.5 MB client-side image limit plus JSON/base64 overhead.
-app.use(express.json({ limit: "3mb" }));
+// 3 MB binary image limit plus JSON/base64 overhead.
+app.use(express.json({ limit: "5mb" }));
 app.use(express.static(require("path").join(__dirname, "public")));
 // Referral links load the same single-page app. The client reads the code and
 // opens the registration form with it already filled in.
@@ -40,7 +40,11 @@ let commissionOrders;
 let commissionStocks;
 let surveyQuestions;
 let surveyAnswers;
+let workerAgreements;
 let mongoClient;
+
+const MAX_PROFILE_IMAGE_BYTES = 3 * 1024 * 1024;
+const WORKER_AGREEMENT_VERSION = "clickworker-rules-v1";
 
 const adminPhone = normalizePhone(process.env.ADMIN_PHONE || "9990000000");
 const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe-Admin-2026!";
@@ -430,8 +434,10 @@ app.post("/api/auth/register", async (req, res) => {
 
 app.post("/api/account/profile-picture", requireAuth, async (req, res) => {
   const imageDataUrl = String(req.body?.imageDataUrl || "");
-  if (!/^data:image\/(png|jpe?g|webp);base64,[a-z0-9+/=]+$/i.test(imageDataUrl) || imageDataUrl.length > 2_200_000) {
-    return res.status(400).json({ message: "Upload a PNG, JPEG, or WebP image smaller than 1.5 MB." });
+  const match = /^data:image\/(png|jpe?g|webp);base64,([a-z0-9+/=]+)$/i.exec(imageDataUrl);
+  const imageBytes = match ? Buffer.byteLength(match[2], "base64") : 0;
+  if (!match || imageBytes === 0 || imageBytes > MAX_PROFILE_IMAGE_BYTES) {
+    return res.status(400).json({ message: "Upload a PNG, JPEG, or WebP image no larger than 3 MB." });
   }
   const updated = await users.findOneAndUpdate(
     { _id: req.user._id },
@@ -1150,59 +1156,96 @@ app.post("/api/tasks/survey/:id/answer", requireAuth, async (req, res) => {
   finally { await session.endSession(); }
 });
 
+// A signed agreement is recorded separately from an application so that the
+// acceptance is auditable and can only be used once for the selected role.
+app.post("/api/workers/agreement", requireAuth, async (req, res) => {
+  const workerLevel = Number(req.body?.workerLevel);
+  const plan = workerPlans[workerLevel];
+  const signature = String(req.body?.signature || "").trim().replace(/\s+/g, " ");
+  const signatureDataUrl = String(req.body?.signatureDataUrl || "");
+  const signatureMatch = /^data:image\/png;base64,([a-z0-9+/=]+)$/i.exec(signatureDataUrl);
+  const signatureBytes = signatureMatch ? Buffer.byteLength(signatureMatch[1], "base64") : 0;
+  const acceptedTerms = req.body?.acceptedTerms === true;
+  const electronicSignatureConsent = req.body?.electronicSignatureConsent === true;
+
+  if (!plan) return res.status(400).json({ message: "Select a valid Worker role." });
+  if (signature.length < 3 || signature.length > 120) return res.status(400).json({ message: "Enter your full name as a signature (3 to 120 characters)." });
+  if (!signatureMatch || signatureBytes > 1_000_000) return res.status(400).json({ message: "Provide a valid electronic signature before applying." });
+  if (!acceptedTerms || !electronicSignatureConsent) {
+    return res.status(400).json({ message: "You must accept the agreement terms and consent to use an electronic signature." });
+  }
+
+  const acceptedAt = new Date();
+  const agreement = {
+    userId: req.user._id,
+    accountId: req.user.accountId,
+    workerLevel,
+    membershipLevel: plan.membershipLevel,
+    agreementVersion: WORKER_AGREEMENT_VERSION,
+    signerName: signature,
+    signatureDataUrl,
+    profileNameAtSigning: req.user.fullName || "",
+    signingMetadata: {
+      ipAddress: String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim(),
+      userAgent: String(req.get("user-agent") || "").slice(0, 512)
+    },
+    consent: {
+      acceptedTerms: true,
+      electronicSignatureConsent: true,
+      acceptedBy: "member",
+      acceptedAt
+    },
+    status: "accepted",
+    acceptedAt,
+    usedAt: null,
+    applicationTransactionId: null
+  };
+  const result = await workerAgreements.insertOne(agreement);
+  return res.status(201).json({
+    message: "Agreement accepted. You may now apply for this Worker role.",
+    agreement: {
+      id: result.insertedId.toString(), workerLevel, membershipLevel: plan.membershipLevel,
+      agreementVersion: WORKER_AGREEMENT_VERSION, acceptedAt
+    }
+  });
+});
+
 app.post("/api/workers/apply", requireAuth, async (req, res) => {
   const workerLevel = Number(req.body?.workerLevel);
   const plan = workerPlans[workerLevel];
   if (!plan) return res.status(400).json({ message: "Select a valid Worker role." });
-  if (Number(req.user.activeWorker || 0) === workerLevel) {
-    return res.status(409).json({ code: "MEMBERSHIP_ALREADY_ACTIVE", message: `You are already assigned to the ${plan.membershipLevel} Worker role.` });
-  }
+  if (Number(req.user.activeWorker || 0) === workerLevel) return res.status(409).json({ code: "MEMBERSHIP_ALREADY_ACTIVE", message: `You are already assigned to the ${plan.membershipLevel} Worker role.` });
 
   const appliedAt = new Date();
   const membershipExpiresAt = new Date(appliedAt.getTime() + 360 * 24 * 60 * 60 * 1000);
-  const session = mongoClient.startSession();
-  let referralApplied = false;
+  const session = mongoClient.startSession(); let referralApplied = false;
   try {
     await session.withTransaction(async () => {
-      // Keep balance debit, membership activation, and ledger record atomic. The
-      // balance condition prevents duplicate concurrent requests from overspending.
+      const acceptedAgreement = await workerAgreements.findOneAndUpdate(
+        { userId: req.user._id, workerLevel, status: "accepted", usedAt: null },
+        { $set: { status: "used", usedAt: appliedAt } },
+        { sort: { acceptedAt: -1 }, returnDocument: "before", session }
+      );
+      if (!acceptedAgreement) { const error = new Error("Read, accept, and electronically sign the Worker agreement before applying."); error.status = 400; throw error; }
+      const agreementId = acceptedAgreement._id.toString();
+      const agreementRecord = { id: agreementId, version: acceptedAgreement.agreementVersion, signerName: acceptedAgreement.signerName, acceptedAt: acceptedAgreement.acceptedAt, usedAt: appliedAt };
       const debit = await users.updateOne(
         { _id: req.user._id, balance: { $gte: plan.cost } },
-        { $inc: { balance: -plan.cost }, $set: { activeWorker: workerLevel, membershipLevel: plan.membershipLevel, workerPurchasedAt: appliedAt, membershipExpiresAt }, $push: { activities: { type: "worker_application", title: `Applied: ${plan.membershipLevel}`, amount: -plan.cost, points: 0, createdAt: appliedAt } } },
+        { $inc: { balance: -plan.cost }, $set: { activeWorker: workerLevel, membershipLevel: plan.membershipLevel, workerPurchasedAt: appliedAt, membershipExpiresAt, lastWorkerAgreement: agreementRecord }, $push: { activities: { type: "worker_application", title: `Applied: ${plan.membershipLevel}`, amount: -plan.cost, points: 0, agreementId, createdAt: appliedAt } } },
         { session }
       );
-      if (debit.modifiedCount !== 1) {
-        const error = new Error("Insufficient Cash Wallet balance. Deposit funds before applying for this worker.");
-        error.status = 400;
-        throw error;
-      }
-      const transaction = { userId: req.user._id, accountId: req.user.accountId, type: "worker_application", status: "completed", amount: -plan.cost, paymentMethod: "Cash Wallet", description: `Applied for ${plan.membershipLevel} using Cash Wallet`, workerLevel, createdAt: appliedAt };
-      await transactions.insertOne(transaction, { session });
-
-      // Reward applies once, when referred member buys first membership.
+      if (debit.modifiedCount !== 1) { const error = new Error("Insufficient Cash Wallet balance. Deposit funds before applying for this worker."); error.status = 400; throw error; }
+      const transactionResult = await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "worker_application", status: "completed", amount: -plan.cost, paymentMethod: "Cash Wallet", description: `Applied for ${plan.membershipLevel} using Cash Wallet`, workerLevel, agreementId, agreementVersion: acceptedAgreement.agreementVersion, createdAt: appliedAt }, { session });
+      await workerAgreements.updateOne({ _id: acceptedAgreement._id }, { $set: { applicationTransactionId: transactionResult.insertedId, appliedAt } }, { session });
       if (req.user.invitedByUserId && !req.user.referralRewardAppliedAt) {
         const rewardId = `${req.user._id.toString()}:first-membership`;
-        try {
-          await referralRewards.insertOne({ rewardId, inviterUserId: req.user.invitedByUserId, newMemberUserId: req.user._id, newMemberAccountId: req.user.accountId, workerLevel, referralPercent: plan.referralPercent, referralBonus: plan.referralBonus, starterShare: plan.starterShare, inviterShare: plan.inviterShare, createdAt: appliedAt }, { session });
-          await users.updateOne({ _id: req.user._id }, { $inc: { balance: plan.starterShare }, $set: { referralRewardAppliedAt: appliedAt }, $push: { activities: { type: "referral_starter_bonus", title: "Referral starter balance", amount: plan.starterShare, points: 0, createdAt: appliedAt } } }, { session });
-          await users.updateOne({ _id: req.user.invitedByUserId }, { $inc: { balance: plan.inviterShare, referralEarnings: plan.inviterShare }, $push: { activities: { type: "referral_bonus", title: `Referral reward from ${req.user.accountId}`, amount: plan.inviterShare, points: 0, createdAt: appliedAt } } }, { session });
-          await transactions.insertMany([
-            { userId: req.user._id, accountId: req.user.accountId, type: "referral_starter_bonus", status: "completed", amount: plan.starterShare, paymentMethod: "Referral", description: `40% starter balance from Worker ${workerLevel} referral bonus`, createdAt: appliedAt },
-            { userId: req.user.invitedByUserId, type: "referral_bonus", status: "completed", amount: plan.inviterShare, paymentMethod: "Referral", description: `60% referral reward from account ${req.user.accountId}`, createdAt: appliedAt }
-          ], { session });
-          referralApplied = true;
-        } catch (error) {
-          if (error?.code !== 11000) throw error;
-        }
+        try { await referralRewards.insertOne({ rewardId, inviterUserId: req.user.invitedByUserId, newMemberUserId: req.user._id, newMemberAccountId: req.user.accountId, workerLevel, referralPercent: plan.referralPercent, referralBonus: plan.referralBonus, starterShare: plan.starterShare, inviterShare: plan.inviterShare, createdAt: appliedAt }, { session }); await users.updateOne({ _id: req.user._id }, { $inc: { balance: plan.starterShare }, $set: { referralRewardAppliedAt: appliedAt }, $push: { activities: { type: "referral_starter_bonus", title: "Referral starter balance", amount: plan.starterShare, points: 0, createdAt: appliedAt } } }, { session }); await users.updateOne({ _id: req.user.invitedByUserId }, { $inc: { balance: plan.inviterShare, referralEarnings: plan.inviterShare }, $push: { activities: { type: "referral_bonus", title: `Referral reward from ${req.user.accountId}`, amount: plan.inviterShare, points: 0, createdAt: appliedAt } } }, { session }); await transactions.insertMany([{ userId: req.user._id, accountId: req.user.accountId, type: "referral_starter_bonus", status: "completed", amount: plan.starterShare, paymentMethod: "Referral", description: `40% starter balance from Worker ${workerLevel} referral bonus`, createdAt: appliedAt }, { userId: req.user.invitedByUserId, type: "referral_bonus", status: "completed", amount: plan.inviterShare, paymentMethod: "Referral", description: `60% referral reward from account ${req.user.accountId}`, createdAt: appliedAt }], { session }); referralApplied = true; } catch (error) { if (error?.code !== 11000) throw error; }
       }
     });
-  } catch (error) {
-    return res.status(error.status || 400).json({ message: error.message || "Could not complete worker application." });
-  } finally { await session.endSession(); }
+  } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not complete worker application." }); } finally { await session.endSession(); }
   const updated = await users.findOne({ _id: req.user._id });
   return res.json({ message: `Application accepted for ${plan.membershipLevel}. Tasks are now unlocked.${referralApplied ? ` ₱${plan.starterShare.toFixed(2)} referral starter balance added.` : ""}`, user: publicUser(updated), transaction: { type: "worker_application", status: "completed", amount: -plan.cost } });
 });
-
 app.post("/api/wallet/topup", requireAuth, async (req, res) => {
   const amount = Number(req.body?.amount);
   if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) return res.status(400).json({ message: "Enter a valid top-up amount." });
@@ -1260,6 +1303,7 @@ async function start() {
   commissionStocks = db.collection("commission_stocks");
   surveyQuestions = db.collection("survey_questions");
   surveyAnswers = db.collection("survey_answers");
+  workerAgreements = db.collection("worker_agreements");
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ accountId: 1 }, { unique: true, sparse: true });
   await transactions.createIndex({ userId: 1, createdAt: -1 });
@@ -1282,6 +1326,8 @@ async function start() {
   await surveyQuestions.createIndex({ active: 1, sortOrder: 1 });
   await surveyAnswers.createIndex({ userId: 1, questionId: 1 }, { unique: true });
   await surveyAnswers.createIndex({ userId: 1, dayKey: 1, answeredAt: -1 });
+  await workerAgreements.createIndex({ agreementId: 1 }, { unique: true });
+  await workerAgreements.createIndex({ userId: 1, createdAt: -1 });
   const surveyBank = buildSurveyQuestionBank();
   if (surveyBank.length !== 500) throw new Error(`Expected 500 survey questions, generated ${surveyBank.length}.`);
   await surveyQuestions.bulkWrite(surveyBank.map(question => ({ updateOne: { filter: { questionKey: question.questionKey }, update: { $set: question }, upsert: true } })), { ordered: false });
