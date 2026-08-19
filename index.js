@@ -1324,7 +1324,8 @@ app.post("/api/wallet/paymongo/checkout", requireAuth, async (req, res) => {
     const attributes = checkout?.data?.attributes || {};
     const checkoutUrl = attributes.checkout_url;
     if (!checkoutUrl) throw new Error("PayMongo did not return a checkout URL.");
-    await paymentOrders.updateOne({ _id: order._id }, { $set: { checkoutSessionId: checkout.data.id, checkoutUrl, referenceNumber, updatedAt: new Date() } });
+    const checkoutExpiresAt = attributes.expires_at ? new Date(Number(attributes.expires_at) * 1000) : new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await paymentOrders.updateOne({ _id: order._id }, { $set: { checkoutSessionId: checkout.data.id, checkoutUrl, referenceNumber, checkoutExpiresAt, updatedAt: new Date() } });
     return res.status(201).json({ orderId: order._id.toString(), checkoutUrl, message: "Redirecting to PayMongo secure checkout." });
   } catch (error) {
     await paymentOrders.updateOne({ _id: order._id }, { $set: { status: "failed", failureReason: String(error.message || "Checkout setup failed.").slice(0, 500), updatedAt: new Date() } });
@@ -1332,11 +1333,25 @@ app.post("/api/wallet/paymongo/checkout", requireAuth, async (req, res) => {
   }
 });
 
+async function expireStalePaymongoOrder(order) {
+  if (!order || !["pending", "processing"].includes(String(order.status || ""))) return order;
+  const checkoutExpiresAt = order.checkoutExpiresAt ? new Date(order.checkoutExpiresAt) : null;
+  const fallbackExpiresAt = new Date(new Date(order.createdAt || Date.now()).getTime() + 24 * 60 * 60 * 1000);
+  const expiresAt = checkoutExpiresAt && !Number.isNaN(checkoutExpiresAt.getTime()) ? checkoutExpiresAt : fallbackExpiresAt;
+  if (expiresAt.getTime() > Date.now()) return order;
+  await paymentOrders.updateOne(
+    { _id: order._id, status: { $in: ["pending", "processing"] } },
+    { $set: { status: "expired", failureReason: "Checkout expired before payment confirmation.", expiredAt: new Date(), updatedAt: new Date() } },
+  );
+  return paymentOrders.findOne({ _id: order._id });
+}
+
 app.get("/api/wallet/paymongo/orders/:id", requireAuth, async (req, res) => {
   let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid payment order." }); }
-  const order = await paymentOrders.findOne({ _id: id, userId: req.user._id });
+  let order = await paymentOrders.findOne({ _id: id, userId: req.user._id });
   if (!order) return res.status(404).json({ message: "Payment order not found." });
-  return res.json({ order: { id: order._id.toString(), amount: order.amount, currency: order.currency, status: order.status, createdAt: order.createdAt, paidAt: order.paidAt || null } });
+  order = await expireStalePaymongoOrder(order);
+  return res.json({ order: { id: order._id.toString(), amount: order.amount, currency: order.currency, status: order.status, referenceNumber: order.referenceNumber || "", failureReason: order.failureReason || "", createdAt: order.createdAt, checkoutExpiresAt: order.checkoutExpiresAt || null, paidAt: order.paidAt || null } });
 });
 
 app.post("/api/paymongo/webhook", async (req, res) => {
@@ -1438,6 +1453,7 @@ async function start() {
   await workerAgreements.createIndex({ agreementId: 1 }, { unique: true });
   await workerAgreements.createIndex({ userId: 1, createdAt: -1 });
   await paymentOrders.createIndex({ userId: 1, createdAt: -1 });
+  await paymentOrders.createIndex({ userId: 1, status: 1, createdAt: -1 });
   await paymentOrders.createIndex({ checkoutSessionId: 1 }, { unique: true, sparse: true });
   await transactions.createIndex({ userId: 1, type: 1, scheduleKey: 1 }, { unique: true, partialFilterExpression: { type: 'withdrawal', scheduleKey: { $type: 'string' } } });
   const surveyBank = buildSurveyQuestionBank();
