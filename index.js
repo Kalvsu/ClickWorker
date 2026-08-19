@@ -6,21 +6,62 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const svgCaptcha = require("svg-captcha");
 const sharp = require("sharp");
+const crypto = require("crypto");
 const { MongoClient, ObjectId } = require("mongodb");
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
 const mongoUri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "clickworker";
+const paymongoSecretKey = process.env.PAYMONGO_SECRET_KEY || "";
+const paymongoWebhookSecret = process.env.PAYMONGO_WEBHOOK_SECRET || "";
+const appBaseUrl = String(process.env.APP_BASE_URL || "").replace(/\/$/, "");
 
 if (!mongoUri || !process.env.JWT_SECRET) {
   throw new Error("MONGODB_URI and JWT_SECRET must be set in server/.env");
 }
 
+function requestOrigin(req) {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const protocol = forwardedProto || req.protocol || "https";
+  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "").split(",")[0].trim();
+  return appBaseUrl || (host ? `${protocol}://${host}` : "");
+}
+
+function paymongoAuthHeader() { return `Basic ${Buffer.from(`${paymongoSecretKey}:`).toString("base64")}`; }
+
+async function paymongoRequest(path, method, body) {
+  const response = await fetch(`https://api.paymongo.com${path}`, { method, headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: paymongoAuthHeader() }, body: body ? JSON.stringify(body) : undefined });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) { const error = new Error(json?.errors?.[0]?.detail || json?.errors?.[0]?.code || "PayMongo request failed."); error.status = response.status; throw error; }
+  return json;
+}
+
+function validPaymongoSignature(req) {
+  if (!paymongoWebhookSecret) return false;
+  const signature = String(req.get("Paymongo-Signature") || "");
+  const parts = Object.fromEntries(signature.split(",").map(part => { const index = part.indexOf("="); return index > 0 ? [part.slice(0, index).trim(), part.slice(index + 1).trim()] : ["", ""]; }));
+  const timestamp = parts.t;
+  const expected = paymongoSecretKey.startsWith("sk_live_") ? parts.li : parts.te;
+  if (!timestamp || !expected || !req.rawBody || Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
+  const hash = crypto.createHmac("sha256", paymongoWebhookSecret).update(`${timestamp}.${req.rawBody}`).digest("hex");
+  try { return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(expected, "hex")); } catch (_) { return false; }
+}
+async function creditPaidPaymongoOrder(orderId, checkoutSessionId, paymentId, paidAt) {
+  const order = await paymentOrders.findOneAndUpdate({ _id: orderId, status: { $in: ["pending", "processing"] } }, { $set: { status: "processing", checkoutSessionId: checkoutSessionId || null, paymentId: paymentId || null, paidAt: paidAt || new Date(), updatedAt: new Date() } }, { returnDocument: "before" });
+  if (!order) return false;
+  const now = new Date();
+  const credit = await users.updateOne({ _id: order.userId }, { $inc: { balance: order.amount }, $push: { activities: { type: "topup", title: "PayMongo wallet top-up", amount: order.amount, points: 0, paymentOrderId: order._id.toString(), createdAt: now } } });
+  if (credit.modifiedCount !== 1) throw new Error("Payment user could not be credited.");
+  await transactions.insertOne({ userId: order.userId, accountId: order.accountId, type: "topup", status: "completed", amount: order.amount, paymentMethod: "PayMongo", description: "PayMongo Checkout wallet top-up", paymentOrderId: order._id.toString(), paymongoCheckoutSessionId: checkoutSessionId || null, paymongoPaymentId: paymentId || null, createdAt: now });
+  await paymentOrders.updateOne({ _id: order._id }, { $set: { status: "paid", creditedAt: now, updatedAt: now } });
+  return true;
+}
+
 app.use(cors());
 // Profile photos are stored as data URLs for the local prototype. Allow the
 // 3 MB binary image limit plus JSON/base64 overhead.
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "5mb", verify: (req, _res, buffer) => { if (req.originalUrl === "/api/paymongo/webhook") req.rawBody = buffer.toString("utf8"); } }));
 app.use(express.static(require("path").join(__dirname, "public")));
 // Referral links load the same single-page app. The client reads the code and
 // opens the registration form with it already filled in.
@@ -41,10 +82,13 @@ let commissionStocks;
 let surveyQuestions;
 let surveyAnswers;
 let workerAgreements;
+let paymentOrders;
 let mongoClient;
 
 const MAX_PROFILE_IMAGE_BYTES = 3 * 1024 * 1024;
 const WORKER_AGREEMENT_VERSION = "clickworker-rules-v1";
+const PAYMONGO_CHECKOUT_URL = "https://api.paymongo.com/v1/checkout_sessions";
+const PAYMONGO_CURRENCY = "PHP";
 
 const adminPhone = normalizePhone(process.env.ADMIN_PHONE || "9990000000");
 const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe-Admin-2026!";
@@ -321,25 +365,37 @@ function safeUserSummary(user) {
   };
 }
 
-function startOfWithdrawalWeek() {
-  const now = new Date();
-  const manila = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Manila" }));
-  const daysSinceMonday = (manila.getDay() + 6) % 7;
-  manila.setDate(manila.getDate() - daysSinceMonday);
-  manila.setHours(0, 0, 0, 0);
-  return new Date(manila.getTime() - 8 * 60 * 60 * 1000);
+function manilaWallClock() {
+  const values = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(new Date()).reduce((map, part) => { if (part.type !== "literal") map[part.type] = Number(part.value); return map; }, {});
+  return new Date(Date.UTC(values.year, values.month - 1, values.day, values.hour, values.minute, values.second));
+}
+
+function withdrawalScheduleForUser(user, now = manilaWallClock()) {
+  const level = Number(user.activeWorker || 0);
+  const schedule = level >= 1 && level <= 3 ? { day: 1, label: "Monday", group: "Worker 1–3" } : level >= 4 && level <= 6 ? { day: 3, label: "Wednesday", group: "Worker 4–6" } : level >= 7 && level <= 9 ? { day: 5, label: "Friday", group: "Worker 7–9" } : null;
+  if (!schedule) return { eligible: false, reason: "Purchase a membership before withdrawing.", nextPeriodAt: null, daysUntilNextPeriod: null };
+  const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const currentDay = today.getUTCDay();
+  const offset = (schedule.day - currentDay + 7) % 7;
+  const candidate = new Date(today); candidate.setUTCDate(candidate.getUTCDate() + offset); candidate.setUTCHours(8, 0, 0, 0);
+  const candidateEnd = new Date(candidate); candidateEnd.setUTCHours(18, 0, 0, 0);
+  let nextPeriodAt = new Date(candidate);
+  if (offset === 0 && now >= candidateEnd) nextPeriodAt = new Date(candidate.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const activeWindow = offset === 0 && now >= candidate && now < candidateEnd;
+  const periodStart = activeWindow ? candidate : null;
+  const periodKey = periodStart ? periodStart.toISOString().slice(0, 10) : "";
+  const daysUntilNextPeriod = Math.max(0, Math.ceil((nextPeriodAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)));
+  return { eligible: activeWindow, schedule, periodKey, periodStartAt: periodStart, periodEndsAt: activeWindow ? candidateEnd : null, nextPeriodAt, daysUntilNextPeriod, reason: activeWindow ? "" : `Withdrawals for ${schedule.group} open every ${schedule.label}, 8:00 AM–6:00 PM (Manila time).` };
 }
 
 async function withdrawalStatus(user) {
-  const limit = Number(workerPlans[Number(user.activeWorker || 0)]?.weeklyWithdrawalLimit || 0);
-  const items = await transactions.aggregate([
-    { $match: { userId: user._id, type: "withdrawal", status: { $in: ["pending", "completed"] }, createdAt: { $gte: startOfWithdrawalWeek() } } },
-    { $group: { _id: null, total: { $sum: { $abs: "$amount" } } } }
-  ]).toArray();
-  const used = Number(items[0]?.total || 0);
-  return { limit, used, remaining: Math.max(0, limit - used), resetsAt: new Date(startOfWithdrawalWeek().getTime() + 7 * 24 * 60 * 60 * 1000) };
+  const schedule = withdrawalScheduleForUser(user);
+  if (!schedule.schedule) return { ...schedule, balance: Number(user.balance || 0), alreadyRequested: false, canWithdraw: false };
+  const existing = schedule.periodKey ? await transactions.findOne({ userId: user._id, type: "withdrawal", scheduleKey: schedule.periodKey }) : null;
+  const alreadyRequested = Boolean(existing);
+  const balance = Number(user.balance || 0);
+  return { ...schedule, balance, alreadyRequested, requestedWithdrawal: existing ? { id: existing._id.toString(), status: existing.status, amount: Math.abs(Number(existing.amount || 0)), createdAt: existing.createdAt } : null, canWithdraw: Boolean(schedule.eligible && !alreadyRequested && balance > 0) };
 }
-
 async function generateAccountId() {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const accountId = String(Math.floor(100000 + Math.random() * 900000));
@@ -955,7 +1011,7 @@ app.get("/api/admin/withdrawals", requireAuth, requireAdmin, async (_req, res) =
   const accountIds = [...new Set(items.map(item => item.accountId).filter(Boolean))];
   const owners = await users.find({ accountId: { $in: accountIds } }).project({ accountId: 1, fullName: 1 }).toArray();
   const names = new Map(owners.map(item => [item.accountId, item.fullName]));
-  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, scheduleKey: item.scheduleKey || "", scheduledDay: item.scheduledDay || "", createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
 });
 
 app.patch("/api/admin/withdrawals/:id", requireAuth, requireAdmin, async (req, res) => {
@@ -1246,16 +1302,56 @@ app.post("/api/workers/apply", requireAuth, async (req, res) => {
   const updated = await users.findOne({ _id: req.user._id });
   return res.json({ message: `Application accepted for ${plan.membershipLevel}. Tasks are now unlocked.${referralApplied ? ` ₱${plan.starterShare.toFixed(2)} referral starter balance added.` : ""}`, user: publicUser(updated), transaction: { type: "worker_application", status: "completed", amount: -plan.cost } });
 });
-app.post("/api/wallet/topup", requireAuth, async (req, res) => {
+app.post("/api/wallet/paymongo/checkout", requireAuth, async (req, res) => {
+  if (!paymongoSecretKey) return res.status(503).json({ message: "PayMongo is not configured. Add PAYMONGO_SECRET_KEY in the server environment." });
   const amount = Number(req.body?.amount);
-  if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) return res.status(400).json({ message: "Enter a valid top-up amount." });
-  const activity = { type: "topup", title: "Wallet top-up", amount, points: 0, createdAt: new Date() };
-  await users.updateOne({ _id: req.user._id }, { $inc: { balance: amount }, $push: { activities: activity } });
-  await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "topup", status: "completed", amount, paymentMethod: "QRPh", description: "Wallet top-up (local test payment)", createdAt: new Date() });
-  const updated = await users.findOne({ _id: req.user._id });
-  return res.json({ message: "Top-up successful.", user: publicUser(updated) });
+  if (!Number.isFinite(amount) || amount < 1 || amount > 1_000_000) return res.status(400).json({ message: "Enter a top-up amount from ₱1.00 to ₱1,000,000.00." });
+  const origin = requestOrigin(req);
+  if (!/^https:\/\//i.test(origin) && process.env.NODE_ENV === "production") return res.status(400).json({ message: "APP_BASE_URL must be an HTTPS public URL for payment redirects." });
+  const createdAt = new Date();
+  const order = { userId: req.user._id, accountId: req.user.accountId, amount: Number(amount.toFixed(2)), amountCentavos: Math.round(amount * 100), currency: PAYMONGO_CURRENCY, provider: "paymongo", status: "pending", createdAt, updatedAt: createdAt };
+  const created = await paymentOrders.insertOne(order); order._id = created.insertedId;
+  const referenceNumber = `CW-${req.user.accountId}-${created.insertedId.toString()}`;
+  try {
+    const checkout = await paymongoRequest("/v1/checkout_sessions", "POST", { data: { attributes: { billing: { name: req.user.fullName || "ClickWorker Member", phone: req.user.phone || undefined }, cancel_url: `${origin}/?payment=cancelled&order=${created.insertedId}`, success_url: `${origin}/?payment=return&order=${created.insertedId}`, client_reference_number: created.insertedId.toString(), reference_number: referenceNumber, description: "ClickWorker Cash Wallet top-up", line_items: [{ amount: order.amountCentavos, currency: PAYMONGO_CURRENCY, name: "ClickWorker Cash Wallet", quantity: 1 }], payment_method_types: ["gcash", "paymaya", "card"], send_email_receipt: false, show_description: true, show_line_items: true } } });
+    const attributes = checkout?.data?.attributes || {};
+    const checkoutUrl = attributes.checkout_url;
+    if (!checkoutUrl) throw new Error("PayMongo did not return a checkout URL.");
+    await paymentOrders.updateOne({ _id: order._id }, { $set: { checkoutSessionId: checkout.data.id, checkoutUrl, referenceNumber, updatedAt: new Date() } });
+    return res.status(201).json({ orderId: order._id.toString(), checkoutUrl, message: "Redirecting to PayMongo secure checkout." });
+  } catch (error) {
+    await paymentOrders.updateOne({ _id: order._id }, { $set: { status: "failed", failureReason: String(error.message || "Checkout setup failed.").slice(0, 500), updatedAt: new Date() } });
+    return res.status(error.status || 502).json({ message: error.message || "Could not start PayMongo checkout." });
+  }
 });
 
+app.get("/api/wallet/paymongo/orders/:id", requireAuth, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid payment order." }); }
+  const order = await paymentOrders.findOne({ _id: id, userId: req.user._id });
+  if (!order) return res.status(404).json({ message: "Payment order not found." });
+  return res.json({ order: { id: order._id.toString(), amount: order.amount, currency: order.currency, status: order.status, createdAt: order.createdAt, paidAt: order.paidAt || null } });
+});
+
+app.post("/api/paymongo/webhook", async (req, res) => {
+  if (!validPaymongoSignature(req)) return res.status(401).json({ message: "Invalid webhook signature." });
+  const payload = req.body?.data || {};
+  const eventType = String(payload.type || "");
+  if (eventType !== "checkout_session.payment.paid") return res.status(200).json({ received: true, ignored: true });
+  const session = payload.data || {};
+  const details = session.attributes || {};
+  const checkoutSessionId = String(session.id || "");
+  const orderId = String(details.client_reference_number || "");
+  let objectId; try { objectId = new ObjectId(orderId); } catch (_) { return res.status(200).json({ received: true, ignored: true }); }
+  try {
+    const order = await paymentOrders.findOne({ _id: objectId, provider: "paymongo" });
+    const lineAmount = Math.round(Number(details.line_items?.[0]?.amount || 0));
+    const eventLiveMode = Boolean(payload.livemode);
+    if (!order || !checkoutSessionId || lineAmount !== order.amountCentavos || String(details.currency || PAYMONGO_CURRENCY).toUpperCase() !== PAYMONGO_CURRENCY || eventLiveMode !== paymongoSecretKey.startsWith("sk_live_")) return res.status(200).json({ received: true, ignored: true });
+    const paymentId = details.payment_intent?.id || details.payment_intent?.attributes?.id || details.payments?.[0]?.id || "";
+    await creditPaidPaymongoOrder(objectId, checkoutSessionId, paymentId, new Date());
+    return res.status(200).json({ received: true });
+  } catch (error) { console.error("paymongo webhook", error); return res.status(500).json({ message: "Webhook processing failed." }); }
+});
 app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
   const amount = Number(req.body?.amount);
   const withdrawalPassword = String(req.body?.withdrawalPassword || "");
@@ -1263,19 +1359,24 @@ app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
   if (!req.user.withdrawalBank?.accountNumber) return res.status(400).json({ message: "Add one personal bank account before withdrawing." });
   if (!req.user.withdrawalPasswordHash) return res.status(400).json({ message: "Set your withdrawal password first." });
   if (!(await bcrypt.compare(withdrawalPassword, req.user.withdrawalPasswordHash))) return res.status(401).json({ message: "Incorrect withdrawal password." });
-  const weekly = await withdrawalStatus(req.user);
-  if (weekly.limit <= 0) return res.status(403).json({ message: "Purchase a membership before withdrawing." });
-  if (amount > weekly.remaining) return res.status(400).json({ message: `Weekly withdrawal limit exceeded. Remaining this week: ₱${weekly.remaining.toFixed(2)}.` });
-  const result = await users.findOneAndUpdate(
-    { _id: req.user._id, balance: { $gte: amount } },
-    { $inc: { balance: -amount }, $push: { activities: { type: "withdraw", title: "Bank withdrawal request", amount: -amount, points: 0, status: "pending", createdAt: new Date() } } },
-    { returnDocument: "after" }
-  );
-  if (!result) return res.status(400).json({ message: "Insufficient balance." });
-  await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), createdAt: new Date() });
-  return res.json({ message: "Withdrawal request submitted and saved as pending.", user: publicUser(result) });
+  const schedule = withdrawalScheduleForUser(req.user);
+  if (!schedule.eligible) return res.status(403).json({ message: schedule.reason, withdrawal: await withdrawalStatus(req.user) });
+  if (amount > Number(req.user.balance || 0)) return res.status(400).json({ message: `Amount cannot exceed your Cash Wallet balance of ₱${Number(req.user.balance || 0).toFixed(2)}.` });
+  const alreadyRequested = await transactions.findOne({ userId: req.user._id, type: "withdrawal", scheduleKey: schedule.periodKey });
+  if (alreadyRequested) return res.status(409).json({ message: "You have already submitted a withdrawal request for this scheduled period." });
+  const now = new Date();
+  const request = { userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), scheduleKey: schedule.periodKey, scheduledDay: schedule.schedule.label, createdAt: now };
+  const session = mongoClient.startSession();
+  try {
+    let updated;
+    await session.withTransaction(async () => {
+      try { await transactions.insertOne(request, { session }); } catch (error) { if (error?.code === 11000) { const duplicate = new Error("You have already submitted a withdrawal request for this scheduled period."); duplicate.status = 409; throw duplicate; } throw error; }
+      updated = await users.findOneAndUpdate({ _id: req.user._id, balance: { $gte: amount } }, { $inc: { balance: -amount }, $push: { activities: { type: "withdraw", title: "Bank withdrawal request", amount: -amount, points: 0, status: "pending", scheduleKey: schedule.periodKey, createdAt: now } } }, { returnDocument: "after", session });
+      if (!updated) { const error = new Error("Insufficient balance."); error.status = 400; throw error; }
+    });
+    return res.json({ message: "Withdrawal request submitted for your scheduled period.", user: publicUser(updated) });
+  } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not submit withdrawal." }); } finally { await session.endSession(); }
 });
-
 app.post("/api/activities/complete", requireAuth, async (req, res) => {
   const allowed = { daily_checkin: ["Daily check-in", 5], task_center: ["Task completed", 20], share: ["Share & Earn", 10] };
   const reward = allowed[String(req.body?.activity)];
@@ -1304,6 +1405,7 @@ async function start() {
   surveyQuestions = db.collection("survey_questions");
   surveyAnswers = db.collection("survey_answers");
   workerAgreements = db.collection("worker_agreements");
+  paymentOrders = db.collection("payment_orders");
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ accountId: 1 }, { unique: true, sparse: true });
   await transactions.createIndex({ userId: 1, createdAt: -1 });
@@ -1328,6 +1430,9 @@ async function start() {
   await surveyAnswers.createIndex({ userId: 1, dayKey: 1, answeredAt: -1 });
   await workerAgreements.createIndex({ agreementId: 1 }, { unique: true });
   await workerAgreements.createIndex({ userId: 1, createdAt: -1 });
+  await paymentOrders.createIndex({ userId: 1, createdAt: -1 });
+  await paymentOrders.createIndex({ checkoutSessionId: 1 }, { unique: true, sparse: true });
+  await transactions.createIndex({ userId: 1, type: 1, scheduleKey: 1 }, { unique: true, partialFilterExpression: { type: 'withdrawal', scheduleKey: { $type: 'string' } } });
   const surveyBank = buildSurveyQuestionBank();
   if (surveyBank.length !== 500) throw new Error(`Expected 500 survey questions, generated ${surveyBank.length}.`);
   await surveyQuestions.bulkWrite(surveyBank.map(question => ({ updateOne: { filter: { questionKey: question.questionKey }, update: { $set: question }, upsert: true } })), { ordered: false });
