@@ -47,15 +47,98 @@ function validPaymongoSignature(req) {
   const hash = crypto.createHmac("sha256", paymongoWebhookSecret).update(`${timestamp}.${req.rawBody}`).digest("hex");
   try { return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(expected, "hex")); } catch (_) { return false; }
 }
+function paymongoFailureReason(attributes, fallback) {
+  const intent = attributes?.payment_intent?.attributes || attributes?.payment_intent || {};
+  const error = intent.last_payment_error || attributes?.last_payment_error || {};
+  return String(error.detail || error.message || error.code || fallback || "Payment was not completed.").slice(0, 500);
+}
+
+function paymongoCheckoutState(attributes) {
+  const intent = attributes?.payment_intent?.attributes || attributes?.payment_intent || {};
+  const payments = Array.isArray(attributes?.payments) ? attributes.payments : [];
+  const states = [attributes?.status, intent.status, ...payments.map(payment => payment?.attributes?.status || payment?.status)]
+    .filter(Boolean).map(value => String(value).toLowerCase());
+  if (states.some(value => ["paid", "succeeded", "success"].includes(value))) return "paid";
+  if (states.some(value => ["cancelled", "canceled"].includes(value))) return "cancelled";
+  if (states.some(value => value === "expired")) return "expired";
+  if (states.some(value => ["failed", "payment_failed"].includes(value))) return "failed";
+  return "pending";
+}
+
+function checkoutAmountCentavos(attributes) {
+  return (Array.isArray(attributes?.line_items) ? attributes.line_items : []).reduce((total, item) => total + Math.round(Number(item?.amount || 0)) * Math.max(1, Math.round(Number(item?.quantity || 1))), 0);
+}
+
+function checkoutPaymentId(attributes) {
+  const intent = attributes?.payment_intent?.attributes || attributes?.payment_intent || {};
+  const payment = Array.isArray(attributes?.payments) ? attributes.payments[0] : null;
+  return String(payment?.id || payment?.attributes?.id || intent.id || "");
+}
+
+function verifyPaymongoCheckout(order, session) {
+  const attributes = session?.attributes || {};
+  const expectedLiveMode = paymongoSecretKey.startsWith("sk_live_");
+  const currency = String(attributes.currency || attributes.line_items?.[0]?.currency || PAYMONGO_CURRENCY).toUpperCase();
+  return Boolean(session?.id && String(session.id) === String(order.checkoutSessionId || "") && String(attributes.client_reference_number || "") === String(order._id) && checkoutAmountCentavos(attributes) === Number(order.amountCentavos) && currency === PAYMONGO_CURRENCY && (typeof session.livemode !== "boolean" || session.livemode === expectedLiveMode));
+}
+
 async function creditPaidPaymongoOrder(orderId, checkoutSessionId, paymentId, paidAt) {
-  const order = await paymentOrders.findOneAndUpdate({ _id: orderId, status: { $in: ["pending", "processing"] } }, { $set: { status: "processing", checkoutSessionId: checkoutSessionId || null, paymentId: paymentId || null, paidAt: paidAt || new Date(), updatedAt: new Date() } }, { returnDocument: "before" });
+  // Provider-confirmed paid payments may supersede a local cancellation/expiry: redirect
+  // URLs are only navigation hints, never proof that the customer has not paid.
+  const now = paidAt || new Date();
+  const order = await paymentOrders.findOneAndUpdate(
+    { _id: orderId, checkoutSessionId, status: { $in: ["pending", "cancelled", "failed", "expired"] } },
+    { $set: { status: "processing", paymentId: paymentId || null, paidAt: now, updatedAt: now }, $unset: { failureReason: "", cancelledAt: "", expiredAt: "" } },
+    { returnDocument: "before" },
+  );
   if (!order) return false;
-  const now = new Date();
-  const credit = await users.updateOne({ _id: order.userId }, { $inc: { balance: order.amount }, $push: { activities: { type: "topup", title: "PayMongo wallet top-up", amount: order.amount, points: 0, paymentOrderId: order._id.toString(), createdAt: now } } });
-  if (credit.modifiedCount !== 1) throw new Error("Payment user could not be credited.");
-  await transactions.insertOne({ userId: order.userId, accountId: order.accountId, type: "topup", status: "completed", amount: order.amount, paymentMethod: "PayMongo", description: "PayMongo Checkout wallet top-up", paymentOrderId: order._id.toString(), paymongoCheckoutSessionId: checkoutSessionId || null, paymongoPaymentId: paymentId || null, createdAt: now });
-  await paymentOrders.updateOne({ _id: order._id }, { $set: { status: "paid", creditedAt: now, updatedAt: now } });
-  return true;
+  try {
+    const credit = await users.updateOne({ _id: order.userId }, { $inc: { balance: order.amount }, $push: { activities: { type: "topup", title: "PayMongo wallet top-up", amount: order.amount, points: 0, paymentOrderId: order._id.toString(), createdAt: now } } });
+    if (credit.modifiedCount !== 1) throw new Error("Payment user could not be credited.");
+    await transactions.insertOne({ userId: order.userId, accountId: order.accountId, type: "topup", status: "completed", amount: order.amount, paymentMethod: "PayMongo", description: "PayMongo Checkout wallet top-up", paymentOrderId: order._id.toString(), paymongoCheckoutSessionId: checkoutSessionId, paymongoPaymentId: paymentId || null, createdAt: now });
+    await paymentOrders.updateOne({ _id: order._id, status: "processing" }, { $set: { status: "paid", creditedAt: now, updatedAt: now } });
+    return true;
+  } catch (error) {
+    // Preserve processing: it is safer to repair an interrupted credit than to permit
+    // another webhook to duplicate a wallet balance change.
+    await paymentOrders.updateOne({ _id: order._id, status: "processing" }, { $set: { reconciliationError: String(error.message || "Credit attempt failed.").slice(0, 500), updatedAt: new Date() } });
+    throw error;
+  }
+}
+async function reconcilePaymongoOrder(order, { cancelledReturn = false } = {}) {
+  if (!order || order.status === "paid" || !order.checkoutSessionId || !paymongoSecretKey) return order;
+  try {
+    const response = await paymongoRequest(`/v1/checkout_sessions/${encodeURIComponent(order.checkoutSessionId)}`, "GET");
+    const checkout = response?.data;
+    if (!verifyPaymongoCheckout(order, checkout)) {
+      await paymentOrders.updateOne({ _id: order._id }, { $set: { reconciliationError: "Could not verify the payment session.", reconciledAt: new Date(), updatedAt: new Date() } });
+      return paymentOrders.findOne({ _id: order._id });
+    }
+    const attributes = checkout.attributes || {};
+    const providerStatus = paymongoCheckoutState(attributes);
+    const now = new Date();
+    if (providerStatus === "paid") {
+      await creditPaidPaymongoOrder(order._id, checkout.id, checkoutPaymentId(attributes), now);
+    } else if (["cancelled", "failed", "expired"].includes(providerStatus)) {
+      await paymentOrders.updateOne(
+        { _id: order._id, status: { $in: ["pending", "processing"] } },
+        { $set: { status: providerStatus, failureReason: paymongoFailureReason(attributes, providerStatus === "cancelled" ? "Payment was cancelled." : providerStatus === "expired" ? "Checkout expired before payment confirmation." : "Payment failed."), reconciledAt: now, updatedAt: now, ...(providerStatus === "cancelled" ? { cancelledAt: now } : {}), ...(providerStatus === "expired" ? { expiredAt: now } : {}) } },
+      );
+    } else if (cancelledReturn) {
+      // PayMongo has confirmed no payment at this point. Keep this terminal locally so
+      // the returning customer gets a clear result; a later paid webhook still wins.
+      await paymentOrders.updateOne(
+        { _id: order._id, status: { $in: ["pending", "processing"] } },
+        { $set: { status: "cancelled", failureReason: "Payment was cancelled or abandoned before completion.", cancelledAt: now, reconciledAt: now, updatedAt: now } },
+      );
+    } else {
+      await paymentOrders.updateOne({ _id: order._id, status: { $in: ["pending", "processing"] } }, { $set: { providerStatus: String(attributes.status || "pending"), reconciledAt: now, updatedAt: now }, $unset: { reconciliationError: "" } });
+    }
+  } catch (error) {
+    // A provider outage must never turn an unverified payment into a failed one.
+    await paymentOrders.updateOne({ _id: order._id, status: { $ne: "paid" } }, { $set: { reconciliationError: String(error.message || "Could not confirm payment status.").slice(0, 500), reconciliationFailedAt: new Date(), updatedAt: new Date() } });
+  }
+  return paymentOrders.findOne({ _id: order._id });
 }
 
 app.use(cors());
@@ -1339,21 +1422,22 @@ async function expireStalePaymongoOrder(order) {
   const fallbackExpiresAt = new Date(new Date(order.createdAt || Date.now()).getTime() + 24 * 60 * 60 * 1000);
   const expiresAt = checkoutExpiresAt && !Number.isNaN(checkoutExpiresAt.getTime()) ? checkoutExpiresAt : fallbackExpiresAt;
   if (expiresAt.getTime() > Date.now()) return order;
-  await paymentOrders.updateOne(
-    { _id: order._id, status: { $in: ["pending", "processing"] } },
-    { $set: { status: "expired", failureReason: "Checkout expired before payment confirmation.", expiredAt: new Date(), updatedAt: new Date() } },
-  );
+  // Reconcile first so a delayed paid event is never replaced by a local expiry.
+  order = await reconcilePaymongoOrder(order);
+  if (!order || !["pending", "processing"].includes(String(order.status || ""))) return order;
+  await paymentOrders.updateOne({ _id: order._id, status: { $in: ["pending", "processing"] } }, { $set: { status: "expired", failureReason: "Checkout expired before payment confirmation.", expiredAt: new Date(), updatedAt: new Date() } });
   return paymentOrders.findOne({ _id: order._id });
 }
 
 app.get("/api/wallet/paymongo/orders/:id", requireAuth, async (req, res) => {
   let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid payment order." }); }
-  let order = await paymentOrders.findOne({ _id: id, userId: req.user._id });
+  let order = await paymentOrders.findOne({ _id: id, userId: req.user._id, provider: "paymongo" });
   if (!order) return res.status(404).json({ message: "Payment order not found." });
+  // Reconcile with PayMongo rather than trusting return/cancel URLs from the browser.
+  if (["pending", "processing"].includes(String(order.status || ""))) order = await reconcilePaymongoOrder(order, { cancelledReturn: req.query.return === "cancelled" });
   order = await expireStalePaymongoOrder(order);
-  return res.json({ order: { id: order._id.toString(), amount: order.amount, currency: order.currency, status: order.status, referenceNumber: order.referenceNumber || "", failureReason: order.failureReason || "", createdAt: order.createdAt, checkoutExpiresAt: order.checkoutExpiresAt || null, paidAt: order.paidAt || null } });
+  return res.json({ order: { id: order._id.toString(), amount: order.amount, currency: order.currency, status: order.status, referenceNumber: order.referenceNumber || "", failureReason: order.failureReason || "", createdAt: order.createdAt, checkoutExpiresAt: order.checkoutExpiresAt || null, paidAt: order.paidAt || null, reconciledAt: order.reconciledAt || null, providerStatus: order.providerStatus || null } });
 });
-
 app.post("/api/paymongo/webhook", async (req, res) => {
   if (!validPaymongoSignature(req)) return res.status(401).json({ message: "Invalid webhook signature." });
   const payload = req.body?.data || {};
@@ -1366,12 +1450,9 @@ app.post("/api/paymongo/webhook", async (req, res) => {
   let objectId; try { objectId = new ObjectId(orderId); } catch (_) { return res.status(200).json({ received: true, ignored: true }); }
   try {
     const order = await paymentOrders.findOne({ _id: objectId, provider: "paymongo" });
-    const lineAmount = Math.round(Number(details.line_items?.[0]?.amount || 0));
     const eventLiveMode = Boolean(payload.livemode);
-    if (!order || !checkoutSessionId || lineAmount !== order.amountCentavos || String(details.currency || PAYMONGO_CURRENCY).toUpperCase() !== PAYMONGO_CURRENCY || eventLiveMode !== paymongoSecretKey.startsWith("sk_live_")) return res.status(200).json({ received: true, ignored: true });
-    const paymentId = details.payment_intent?.id || details.payment_intent?.attributes?.id || details.payments?.[0]?.id || "";
-    await creditPaidPaymongoOrder(objectId, checkoutSessionId, paymentId, new Date());
-    return res.status(200).json({ received: true });
+    if (!order || !checkoutSessionId || eventLiveMode !== paymongoSecretKey.startsWith("sk_live_") || !verifyPaymongoCheckout(order, session)) return res.status(200).json({ received: true, ignored: true });
+    await creditPaidPaymongoOrder(objectId, checkoutSessionId, checkoutPaymentId(details), new Date());    return res.status(200).json({ received: true });
   } catch (error) { console.error("paymongo webhook", error); return res.status(500).json({ message: "Webhook processing failed." }); }
 });
 app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
