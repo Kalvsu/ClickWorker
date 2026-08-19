@@ -89,6 +89,7 @@ const MAX_PROFILE_IMAGE_BYTES = 3 * 1024 * 1024;
 const WORKER_AGREEMENT_VERSION = "clickworker-rules-v1";
 const PAYMONGO_CHECKOUT_URL = "https://api.paymongo.com/v1/checkout_sessions";
 const PAYMONGO_CURRENCY = "PHP";
+const WITHDRAWAL_SUGGESTED_AMOUNTS = [150, 600, 1500, 4000, 10000, 30000, 100000, 250000, 700000, 2000000];
 
 const adminPhone = normalizePhone(process.env.ADMIN_PHONE || "9990000000");
 const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe-Admin-2026!";
@@ -1302,6 +1303,12 @@ app.post("/api/workers/apply", requireAuth, async (req, res) => {
   const updated = await users.findOne({ _id: req.user._id });
   return res.json({ message: `Application accepted for ${plan.membershipLevel}. Tasks are now unlocked.${referralApplied ? ` ₱${plan.starterShare.toFixed(2)} referral starter balance added.` : ""}`, user: publicUser(updated), transaction: { type: "worker_application", status: "completed", amount: -plan.cost } });
 });
+app.get("/api/wallet/paymongo/configuration", requireAuth, requireAdmin, async (req, res) => {
+  const secretConfigured = Boolean(paymongoSecretKey);
+  const webhookConfigured = Boolean(paymongoWebhookSecret);
+  return res.json({ configured: secretConfigured && Boolean(appBaseUrl), secretConfigured, webhookConfigured, mode: paymongoSecretKey.startsWith("sk_live_") ? "live" : paymongoSecretKey.startsWith("sk_test_") ? "test" : "unknown", appBaseUrl: appBaseUrl || null });
+});
+
 app.post("/api/wallet/paymongo/checkout", requireAuth, async (req, res) => {
   if (!paymongoSecretKey) return res.status(503).json({ message: "PayMongo is not configured. Add PAYMONGO_SECRET_KEY in the server environment." });
   const amount = Number(req.body?.amount);
@@ -1355,7 +1362,7 @@ app.post("/api/paymongo/webhook", async (req, res) => {
 app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
   const amount = Number(req.body?.amount);
   const withdrawalPassword = String(req.body?.withdrawalPassword || "");
-  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ message: "Enter a valid withdrawal amount." });
+  if (!Number.isFinite(amount) || !WITHDRAWAL_SUGGESTED_AMOUNTS.includes(amount)) return res.status(400).json({ message: "Select one of the available suggested withdrawal amounts." });
   if (!req.user.withdrawalBank?.accountNumber) return res.status(400).json({ message: "Add one personal bank account before withdrawing." });
   if (!req.user.withdrawalPasswordHash) return res.status(400).json({ message: "Set your withdrawal password first." });
   if (!(await bcrypt.compare(withdrawalPassword, req.user.withdrawalPasswordHash))) return res.status(401).json({ message: "Incorrect withdrawal password." });
