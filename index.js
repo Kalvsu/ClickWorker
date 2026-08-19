@@ -1,0 +1,1309 @@
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const svgCaptcha = require("svg-captcha");
+const sharp = require("sharp");
+const { MongoClient, ObjectId } = require("mongodb");
+
+const app = express();
+const port = Number(process.env.PORT || 3000);
+const mongoUri = process.env.MONGODB_URI;
+const dbName = process.env.MONGODB_DB || "clickworker";
+
+if (!mongoUri || !process.env.JWT_SECRET) {
+  throw new Error("MONGODB_URI and JWT_SECRET must be set in server/.env");
+}
+
+app.use(cors());
+// Profile photos are stored as data URLs for the local prototype. Allow the
+// 1.5 MB client-side image limit plus JSON/base64 overhead.
+app.use(express.json({ limit: "3mb" }));
+app.use(express.static(require("path").join(__dirname, "public")));
+// Referral links load the same single-page app. The client reads the code and
+// opens the registration form with it already filled in.
+app.get("/referral", (_req, res) => res.sendFile(require("path").join(__dirname, "public", "index.html")));
+app.get("/refferal", (_req, res) => res.sendFile(require("path").join(__dirname, "public", "index.html")));
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
+
+let users;
+let transactions;
+let captchaTasks;
+let captchaUsage;
+let notifications;
+let referralRewards;
+let partnershipRewards;
+let supportMessages;
+let commissionOrders;
+let commissionStocks;
+let surveyQuestions;
+let surveyAnswers;
+let mongoClient;
+
+const adminPhone = normalizePhone(process.env.ADMIN_PHONE || "9990000000");
+const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe-Admin-2026!";
+
+// Commission-earn products shown by the capstone application.
+const commissionEarnCompanies = [
+  { id: "questionpro", name: "QuestionPro", category: "Simple Earn", dailyReturnRate: 10.5, min: 500, max: 25000, location: "United States", description: "Online survey and insights platform with survey creation, distribution, reporting, enterprise controls, integrations, and APIs." },
+  { id: "satismeter", name: "SatisMeter", category: "Simple Earn", dailyReturnRate: 9.75, min: 500, max: 20000, location: "United States", description: "Customer-feedback collection product for understanding product experience, satisfaction, and business performance." },
+  { id: "intellipulse", name: "IntelliPulse", category: "Simple Earn", dailyReturnRate: 12.0, min: 1000, max: 30000, location: "United States", description: "Survey intelligence software applying AI and language analysis to qualitative and quantitative responses." },
+  { id: "spoking-polls", name: "Spoking Polls", category: "Simple Earn", dailyReturnRate: 11.25, min: 750, max: 25000, location: "United States", description: "Survey platform supporting multimedia questionnaires, multi-channel delivery, targeting, APIs, dashboards, and analytics." },
+  { id: "mapps-forsurvey", name: "MApps forSurvey", category: "Simple Earn", dailyReturnRate: 10.0, min: 500, max: 18000, location: "United States", description: "Cloud platform for questionnaire creation, survey delivery, management, and market-research data collection." },
+  { id: "userloop", name: "UserLoop", category: "Stable Rewards", dailyReturnRate: 7.5, min: 250, max: 15000, location: "United States", description: "Customer-insight platform for post-purchase, email, and link surveys with response analysis and collaboration." },
+  { id: "multirater", name: "Multirater Surveys", category: "Stable Rewards", dailyReturnRate: 7.0, min: 250, max: 12000, location: "United States", description: "People-analytics survey platform for employee engagement, leadership assessment, feedback, and reporting." },
+  { id: "truesample", name: "TrueSample", category: "Stable Rewards", dailyReturnRate: 6.75, min: 250, max: 10000, location: "San Francisco, United States", description: "Market-research data-quality product that identifies duplicate, unengaged, unqualified, and potentially fraudulent survey responses." },
+  { id: "enquirelabs", name: "EnquireLabs", category: "Stable Rewards", dailyReturnRate: 8.0, min: 500, max: 20000, location: "New York, United States", description: "Marketing and attribution survey platform designed for ecommerce businesses." },
+  { id: "number-analytics", name: "Number Analytics", category: "Stable Rewards", dailyReturnRate: 7.25, min: 500, max: 16000, location: "New York, United States", description: "Cloud market-research tooling for conjoint analysis, demand analysis, and pricing optimization." }
+];
+
+function captchaDailyMax(workerLevel) {
+  return ({ 1: 2, 2: 4, 3: 8 })[Number(workerLevel)] || 0;
+}
+
+function captchaReward(workerLevel) {
+  return ({ 1: 26.95, 2: 36.38, 3: 49.08 })[Number(workerLevel)] || 0;
+}
+
+const surveyTopics = {
+  "Shopping & Retail": ["online shopping", "grocery stores", "local markets", "product reviews", "discount programs", "delivery services", "return policies", "brand loyalty", "mobile shopping", "customer service"],
+  "Technology": ["smartphones", "laptop computers", "mobile applications", "social media", "cloud storage", "password security", "video calls", "artificial intelligence", "online privacy", "home internet"],
+  "Food & Dining": ["home cooking", "food delivery", "restaurants", "healthy meals", "snack products", "coffee shops", "meal planning", "plant-based food", "food labels", "takeout packaging"],
+  "Travel & Transport": ["public transport", "ride-hailing", "domestic travel", "hotel booking", "air travel", "road trips", "travel insurance", "navigation apps", "commuting", "sustainable transport"],
+  "Health & Wellness": ["daily exercise", "sleep habits", "mental wellness", "health applications", "vitamins", "preventive care", "hydration", "work-life balance", "fitness centers", "telemedicine"],
+  "Media & Entertainment": ["streaming video", "online music", "mobile games", "cinema visits", "podcasts", "live events", "digital news", "short videos", "books", "sports viewing"],
+  "Home & Lifestyle": ["home improvement", "household cleaning", "energy saving", "furniture shopping", "home organization", "pet care", "gardening", "smart-home devices", "recycling", "personal hobbies"],
+  "Finance": ["mobile banking", "digital wallets", "saving money", "household budgeting", "online payments", "insurance", "credit products", "financial education", "subscription spending", "investment awareness"],
+  "Education & Work": ["online learning", "work-from-home", "professional training", "team communication", "job searching", "productivity tools", "career planning", "digital skills", "workplace wellness", "freelance work"],
+  "Community & Environment": ["community events", "public parks", "local services", "environmental awareness", "charitable giving", "waste reduction", "renewable energy", "neighborhood safety", "local businesses", "volunteering"]
+};
+
+const surveyVariants = [
+  { prompt: topic => `How often do you use or participate in ${topic}?`, options: ["Never", "Rarely", "Sometimes", "Often", "Very often"] },
+  { prompt: topic => `How satisfied are you with your current experience of ${topic}?`, options: ["Very dissatisfied", "Dissatisfied", "Neutral", "Satisfied", "Very satisfied"] },
+  { prompt: topic => `How important is ${topic} in your daily life?`, options: ["Not important", "Slightly important", "Moderately important", "Important", "Very important"] },
+  { prompt: topic => `How likely are you to recommend products or services related to ${topic}?`, options: ["Very unlikely", "Unlikely", "Not sure", "Likely", "Very likely"] },
+  { prompt: topic => `How do you expect your use of ${topic} to change during the next 12 months?`, options: ["Decrease greatly", "Decrease slightly", "Stay the same", "Increase slightly", "Increase greatly"] }
+];
+
+function buildSurveyQuestionBank() {
+  const questions = [];
+  for (const [category, topics] of Object.entries(surveyTopics)) {
+    for (const topic of topics) {
+      for (const variant of surveyVariants) {
+        const sequence = questions.length + 1;
+        questions.push({ questionKey: `survey-${String(sequence).padStart(3, "0")}`, category, topic, prompt: variant.prompt(topic), options: variant.options, active: true, sortOrder: sequence, createdAt: new Date("2026-08-15T00:00:00.000Z") });
+      }
+    }
+  }
+  return questions;
+}
+
+function captchaDayKey(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+  const value = Object.fromEntries(parts.filter(part => part.type !== "literal").map(part => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
+}
+
+function captchaTaskJson(task, remaining) {
+  return {
+    id: task._id.toString(),
+    title: task.title,
+    imageUrl: `/api/simulator/captcha/${task._id.toString()}/image`,
+    imageDataUrl: task.imageDataUrl,
+    rewardPoints: task.rewardPoints,
+    status: task.status,
+    remaining
+  };
+}
+
+async function awardPartnershipCommission(taskUser, taskValue, taskId, taskTitle, session) {
+  if (!taskUser?.invitedByUserId || !Number.isFinite(Number(taskValue)) || Number(taskValue) <= 0) return [];
+  const directParent = await users.findOne({ _id: taskUser.invitedByUserId }, { session, projection: { _id: 1, accountId: 1, invitedByUserId: 1 } });
+  if (!directParent) return [];
+  // Direct X member task -> owner: 0.45%; Y task -> X parent: 0.30%; Z task -> Y parent: 0.15%.
+  const grandparent = directParent.invitedByUserId
+    ? await users.findOne({ _id: directParent.invitedByUserId }, { session, projection: { _id: 1, invitedByUserId: 1 } })
+    : null;
+  const tier = grandparent?.invitedByUserId ? "Z" : grandparent ? "Y" : "X";
+  const rate = ({ X: 0.45, Y: 0.30, Z: 0.15 })[tier];
+  const recipient = directParent;
+  const amount = Number((Number(taskValue) * rate / 100).toFixed(4));
+  if (!amount) return [];
+  const rewardId = `task:${taskId}:tier:${tier}:recipient:${recipient._id}`;
+  try {
+    await partnershipRewards.insertOne({ rewardId, recipientUserId: recipient._id, recipientAccountId: recipient.accountId, sourceUserId: taskUser._id, sourceAccountId: taskUser.accountId, sourceTaskId: String(taskId), sourceTaskValue: Number(taskValue), tier, rate, amount, createdAt: new Date() }, { session });
+  } catch (error) {
+    if (error?.code === 11000) return [];
+    throw error;
+  }
+  await users.updateOne(
+    { _id: recipient._id },
+    { $inc: { points: amount, partnershipEarnings: amount }, $push: { activities: { type: "partnership_commission", title: `${tier} partnership commission from ${taskUser.accountId}`, points: amount, amount: 0, sourceAccountId: taskUser.accountId, sourceTaskId: String(taskId), partnershipRate: rate, createdAt: new Date() } } },
+    { session }
+  );
+  return [{ tier, rate, amount, recipientAccountId: recipient.accountId }];
+}
+
+async function createCaptchaArtwork() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let answer = "";
+  for (let index = 0; index < 6; index += 1) {
+    answer += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+
+  // svg-captcha renders characters as warped paths rather than plain SVG text.
+  // Rasterizing with sharp gives both the website and Android app a real PNG.
+  const generated = svgCaptcha(answer, {
+    width: 360,
+    height: 118,
+    fontSize: 76,
+    noise: 4,
+    color: false,
+    inverse: false
+  });
+  const redArtwork = generated
+    .replace(/fill="#[0-9a-fA-F]{3,6}"/g, 'fill="#d92b22"')
+    .replace(/stroke="#[0-9a-fA-F]{3,6}"/g, 'stroke="#d92b22"')
+    .replace("</svg>", '<path d="M18 66 C90 28,260 102,342 54" stroke="#d92b22" stroke-width="2" opacity=".68" fill="none"/></svg>');
+  const png = await sharp(Buffer.from(redArtwork))
+    .flatten({ background: "#fffdf9" })
+    .png({ compressionLevel: 8 })
+    .toBuffer();
+  return { answer, imageDataUrl: `data:image/png;base64,${png.toString("base64")}` };
+}
+
+async function ensureCaptchaUsage(userId, dayKey) {
+  try {
+    await captchaUsage.updateOne(
+      { userId, dayKey },
+      { $setOnInsert: { userId, dayKey, claimed: 0, completed: 0, createdAt: new Date() } },
+      { upsert: true }
+    );
+  } catch (error) {
+    // A concurrent request may win the unique-key insert. That is expected.
+    if (error?.code !== 11000) throw error;
+  }
+}
+
+async function claimCaptchaForUser(user) {
+  const dayKey = captchaDayKey();
+  const dailyMax = captchaDailyMax(user.activeWorker);
+  if (!dailyMax) return { error: "Captcha Encoder Worker 1, 2, or 3 must be active.", remaining: 0, dailyMax: 0, status: 403 };
+  await ensureCaptchaUsage(user._id, dayKey);
+  const session = mongoClient.startSession();
+  let outcome;
+  try {
+    await session.withTransaction(async () => {
+      const usage = await captchaUsage.findOne({ userId: user._id, dayKey }, { session });
+      const remaining = Math.max(0, dailyMax - Number(usage?.completed || 0));
+
+      // Idempotent lock: concurrent requests from one account receive the same
+      // currently assigned task rather than consuming two queue entries.
+      const existing = await captchaTasks.findOne(
+        { assignedTo: user._id, status: "assigned", expiresAt: { $gt: new Date() } },
+        { session }
+      );
+      if (existing) {
+        outcome = { task: existing, remaining };
+        return;
+      }
+
+      const reservedUsage = await captchaUsage.findOneAndUpdate(
+        { userId: user._id, dayKey, claimed: { $lt: dailyMax } },
+        { $inc: { claimed: 1 }, $set: { updatedAt: new Date() } },
+        { returnDocument: "after", session }
+      );
+      if (!reservedUsage) {
+        outcome = { error: "Daily CAPTCHA limit reached.", remaining: 0, dailyMax, status: 429 };
+        return;
+      }
+
+      let task = await captchaTasks.findOneAndUpdate(
+        { status: "pending", imageDataUrl: { $type: "string" }, expiresAt: { $gt: new Date() } },
+        { $set: { status: "assigned", assignedTo: user._id, solverAccountId: user.accountId, assignedAt: new Date(), dayKey } },
+        { sort: { createdAt: 1 }, returnDocument: "after", session }
+      );
+      if (!task) {
+        const artwork = await createCaptchaArtwork();
+        const now = new Date();
+        const generated = { source: "self_generated", generationKey: require("crypto").randomUUID(), workerLevel: Number(user.activeWorker), title: "Captcha Encoding", imageDataUrl: artwork.imageDataUrl, imageFormat: "image/png", answerHash: await bcrypt.hash(artwork.answer, 8), status: "assigned", assignedTo: user._id, solverAccountId: user.accountId, assignedAt: now, dayKey, rewardPoints: captchaReward(user.activeWorker), createdAt: now, expiresAt: new Date(now.getTime() + 15 * 60 * 1000) };
+        const inserted = await captchaTasks.insertOne(generated, { session });
+        task = { ...generated, _id: inserted.insertedId };
+      }
+      outcome = { task: { ...task, rewardPoints: captchaReward(user.activeWorker), workerLevel: Number(user.activeWorker) }, remaining, dailyMax };
+    });
+  } catch (error) {
+    if (error?.code === "NO_CAPTCHA_WAITING" || error?.message === "NO_CAPTCHA_WAITING") {
+      const usage = await captchaUsage.findOne({ userId: user._id, dayKey });
+      outcome = {
+        error: "Unable to generate CAPTCHA.",
+        remaining: Math.max(0, dailyMax - Number(usage?.completed || 0)),
+        dailyMax,
+        status: 404
+      };
+    } else {
+      throw error;
+    }
+  } finally {
+    await session.endSession();
+  }
+  return outcome;
+}
+
+const workerPlans = {
+  1: { cost: 1680.00, membershipLevel: "Captcha Encoder Starter", referralPercent: 25, referralBonus: 420.00, starterShare: 168.00, inviterShare: 252.00, weeklyWithdrawalLimit: 150 },
+  2: { cost: 4536.00, membershipLevel: "Captcha Encoder Professional", referralPercent: 28, referralBonus: 1270.08, starterShare: 508.03, inviterShare: 762.05, weeklyWithdrawalLimit: 600 },
+  3: { cost: 12247.20, membershipLevel: "Captcha Encoder Enterprise", referralPercent: 31, referralBonus: 3796.63, starterShare: 1518.65, inviterShare: 2277.98, weeklyWithdrawalLimit: 1500 },
+  4: { cost: 27398.74, membershipLevel: "Survey Worker Starter", referralPercent: 35, referralBonus: 9589.56, starterShare: 3835.82, inviterShare: 5753.74, weeklyWithdrawalLimit: 4000 },
+  5: { cost: 73975.59, membershipLevel: "Survey Worker Professional", referralPercent: 39, referralBonus: 28850.48, starterShare: 11540.19, inviterShare: 17310.29, weeklyWithdrawalLimit: 10000 },
+  6: { cost: 199736.78, membershipLevel: "Survey Worker Enterprise", referralPercent: 43, referralBonus: 85886.82, starterShare: 34354.73, inviterShare: 51532.09, weeklyWithdrawalLimit: 30000 },
+  7: { cost: 539289.32, membershipLevel: "AI Annotation Starter", referralPercent: 47, referralBonus: 253465.98, starterShare: 101386.39, inviterShare: 152079.59, weeklyWithdrawalLimit: 100000 },
+  8: { cost: 1456081.16, membershipLevel: "AI Annotation Professional", referralPercent: 51, referralBonus: 742601.39, starterShare: 297040.56, inviterShare: 445560.83, weeklyWithdrawalLimit: 250000 },
+  9: { cost: 3931419.15, membershipLevel: "AI Annotation Enterprise", referralPercent: 55, referralBonus: 2162280.53, starterShare: 864912.21, inviterShare: 1297368.32, weeklyWithdrawalLimit: 700000 },
+  10: { cost: 10614831.70, membershipLevel: "Worker 10" }
+};
+
+function normalizePhone(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits.startsWith("63") ? `+${digits}` : `+63${digits.replace(/^0/, "")}`;
+}
+
+function publicUser(user) {
+  return {
+    id: user._id.toString(),
+    accountId: user.accountId,
+    phone: user.phone,
+    fullName: user.fullName,
+    username: user.username || "",
+    profileImageDataUrl: user.profileImageDataUrl || "",
+    points: Number(user.points || 0),
+    balance: Number(user.balance || 0),
+    membershipLevel: user.membershipLevel || "No active membership",
+    activeWorker: Number(user.activeWorker || 0),
+    tasksUnlocked: Number(user.activeWorker || 0) > 0,
+    role: user.role || "Member",
+    memberSince: user.createdAt,
+    membershipStartedAt: user.workerPurchasedAt || null,
+    membershipExpiresAt: user.membershipExpiresAt || null,
+    inviteCode: user.inviteCode || (user.accountId ? `CW${user.accountId}` : ""),
+    invitedByAccountId: user.invitedByAccountId || "",
+    guidanceAccepted: Boolean(user.guidanceAcceptedAt),
+    hasWithdrawalPassword: Boolean(user.withdrawalPasswordHash),
+    withdrawalBank: user.withdrawalBank ? {
+      accountName: user.withdrawalBank.accountName || "",
+      bankName: user.withdrawalBank.bankName || "",
+      accountNumberMasked: maskBankAccount(user.withdrawalBank.accountNumber || "")
+    } : null
+  };
+}
+
+function maskBankAccount(value) {
+  const text = String(value || "");
+  if (!text) return "";
+  return `${"•".repeat(Math.max(4, text.length - 4))}${text.slice(-4)}`;
+}
+
+function safeUserSummary(user) {
+  return {
+    ...publicUser(user),
+    restricted: Boolean(user.restricted),
+    banned: Boolean(user.banned),
+    restrictionReason: user.restrictionReason || "",
+    banReason: user.banReason || "",
+    updatedAt: user.updatedAt || user.createdAt
+  };
+}
+
+function startOfWithdrawalWeek() {
+  const now = new Date();
+  const manila = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Manila" }));
+  const daysSinceMonday = (manila.getDay() + 6) % 7;
+  manila.setDate(manila.getDate() - daysSinceMonday);
+  manila.setHours(0, 0, 0, 0);
+  return new Date(manila.getTime() - 8 * 60 * 60 * 1000);
+}
+
+async function withdrawalStatus(user) {
+  const limit = Number(workerPlans[Number(user.activeWorker || 0)]?.weeklyWithdrawalLimit || 0);
+  const items = await transactions.aggregate([
+    { $match: { userId: user._id, type: "withdrawal", status: { $in: ["pending", "completed"] }, createdAt: { $gte: startOfWithdrawalWeek() } } },
+    { $group: { _id: null, total: { $sum: { $abs: "$amount" } } } }
+  ]).toArray();
+  const used = Number(items[0]?.total || 0);
+  return { limit, used, remaining: Math.max(0, limit - used), resetsAt: new Date(startOfWithdrawalWeek().getTime() + 7 * 24 * 60 * 60 * 1000) };
+}
+
+async function generateAccountId() {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const accountId = String(Math.floor(100000 + Math.random() * 900000));
+    if (!(await users.findOne({ accountId }))) return accountId;
+  }
+  throw new Error("Could not generate a unique account ID.");
+}
+
+async function requireAuth(req, res, next) {
+  try {
+    const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await users.findOne({ _id: new ObjectId(payload.sub) });
+    if (!req.user) return res.status(401).json({ message: "Account not found." });
+    if (req.user.banned) return res.status(403).json({ message: "This account has been banned. Contact support." });
+    if (req.user.restricted) return res.status(403).json({ message: "This account is restricted. Contact support." });
+    next();
+  } catch (_) {
+    return res.status(401).json({ message: "Please sign in again." });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (String(req.user?.role || "").toLowerCase() !== "admin") {
+    return res.status(403).json({ message: "Administrator access required." });
+  }
+  next();
+}
+
+function requireAdminAccess(req, res, next) {
+  if (process.env.ADMIN_API_KEY && req.header("X-Admin-Key") === process.env.ADMIN_API_KEY) return next();
+  return requireAuth(req, res, () => requireAdmin(req, res, next));
+}
+
+app.get("/health", (_req, res) => res.json({ ok: Boolean(users) }));
+
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { phone, fullName, referralCode, password } = req.body || {};
+    if (!phone || !fullName || !password) {
+      return res.status(400).json({ message: "All required fields must be completed." });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ message: "Password must be at least 8 characters." });
+    }
+
+    const normalizedPhone = normalizePhone(phone);
+    const existing = await users.findOne({ phone: normalizedPhone });
+    if (existing) return res.status(409).json({ message: "An account already exists for this phone number." });
+
+    const accountId = await generateAccountId();
+    const submittedReferral = String(referralCode || "").trim().toUpperCase();
+    const inviter = submittedReferral ? await users.findOne({ $or: [{ inviteCode: submittedReferral }, { accountId: submittedReferral.replace(/^CW/, "") }] }) : null;
+    if (submittedReferral && !inviter) return res.status(400).json({ message: "Referral code is invalid." });
+    const user = {
+      accountId,
+      inviteCode: `CW${accountId}`,
+      phone: normalizedPhone,
+      fullName: String(fullName).trim(),
+      referralCode: submittedReferral,
+      invitedByUserId: inviter?._id || null,
+      invitedByAccountId: inviter?.accountId || "",
+      passwordHash: await bcrypt.hash(String(password), 12),
+      points: 0,
+      balance: 0,
+      membershipLevel: "No active membership",
+      activeWorker: 0,
+      role: "Member",
+      guidanceAcceptedAt: null,
+      activities: [{ type: "account", title: "Account created", points: 0, amount: 0, createdAt: new Date() }],
+      createdAt: new Date()
+    };
+    const result = await users.insertOne(user);
+    user._id = result.insertedId;
+    if (inviter) await users.updateOne({ _id: inviter._id }, { $inc: { referralCount: 1 } });
+    await notifications.insertOne({
+      userId: user._id,
+      accountId: user.accountId,
+      senderType: "system",
+      title: "Welcome to ClickWorker",
+      message: "Your member account is ready. System and support updates will appear here.",
+      readAt: null,
+      createdAt: new Date()
+    });
+    const token = jwt.sign({ sub: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    return res.status(201).json({ token, user: publicUser(user) });
+  } catch (error) {
+    console.error("register", error);
+    return res.status(500).json({ message: "Unable to create the account." });
+  }
+});
+
+app.post("/api/account/profile-picture", requireAuth, async (req, res) => {
+  const imageDataUrl = String(req.body?.imageDataUrl || "");
+  if (!/^data:image\/(png|jpe?g|webp);base64,[a-z0-9+/=]+$/i.test(imageDataUrl) || imageDataUrl.length > 2_200_000) {
+    return res.status(400).json({ message: "Upload a PNG, JPEG, or WebP image smaller than 1.5 MB." });
+  }
+  const updated = await users.findOneAndUpdate(
+    { _id: req.user._id },
+    { $set: { profileImageDataUrl: imageDataUrl, updatedAt: new Date() } },
+    { returnDocument: "after" }
+  );
+  return res.json({ message: "Profile photo updated.", user: publicUser(updated) });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { phone, password } = req.body || {};
+    let user = await users.findOne({ phone: normalizePhone(phone) });
+    if (!user || !(await bcrypt.compare(String(password || ""), user.passwordHash))) {
+      return res.status(401).json({ message: "Incorrect phone number or password." });
+    }
+    if (user.banned) return res.status(403).json({ message: "This account has been banned. Contact support." });
+    if (user.restricted) return res.status(403).json({ message: "This account is restricted. Contact support." });
+    // Backfill a unique account ID for accounts created before account IDs were introduced.
+    if (!user.accountId) {
+      const accountId = await generateAccountId();
+      await users.updateOne({ _id: user._id, accountId: { $exists: false } }, { $set: { accountId } });
+      user = await users.findOne({ _id: user._id });
+    }
+    const token = jwt.sign({ sub: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    return res.json({ token, user: publicUser(user) });
+  } catch (error) {
+    console.error("login", error);
+    return res.status(500).json({ message: "Unable to sign in right now." });
+  }
+});
+
+app.get("/api/account/profile", requireAuth, async (req, res) => {
+  return res.json({ user: publicUser(req.user), activities: (req.user.activities || []).slice(-30).reverse() });
+});
+
+app.patch("/api/account/profile", requireAuth, async (req, res) => {
+  const fullName = String(req.body?.fullName || "").trim();
+  const username = String(req.body?.username || "").trim();
+  if (fullName.length < 3 || fullName.length > 80) return res.status(400).json({ message: "Name must contain 3 to 80 characters." });
+  if (username && !/^[a-zA-Z0-9._]{3,24}$/.test(username)) return res.status(400).json({ message: "Username must contain 3 to 24 letters, numbers, dots, or underscores." });
+  if (username) {
+    const duplicate = await users.findOne({ _id: { $ne: req.user._id }, usernameLower: username.toLowerCase() });
+    if (duplicate) return res.status(409).json({ message: "Username is already in use." });
+  }
+  const updated = await users.findOneAndUpdate(
+    { _id: req.user._id },
+    { $set: { fullName, username, usernameLower: username.toLowerCase(), updatedAt: new Date() } },
+    { returnDocument: "after" }
+  );
+  return res.json({ message: "Profile updated.", user: publicUser(updated) });
+});
+
+app.post("/api/account/redeem", requireAuth, async (req, res) => {
+  const code = String(req.body?.code || "").trim().toUpperCase();
+  if (!code) return res.status(400).json({ message: "Enter a redeem code." });
+  return res.status(400).json({ message: "Redeem code is invalid or expired." });
+});
+
+function commissionOrderJson(item, now = new Date()) {
+  const dailyReturnRate = Number(item.dailyReturnRate ?? item.apr ?? 0);
+  const createdAt = new Date(item.createdAt);
+  const lockDays = Math.max(1, Number(item.lockDays || 90));
+  const createdAtMs = Number.isNaN(createdAt.getTime()) ? now.getTime() : createdAt.getTime();
+  const storedUnlockAt = new Date(item.unlockAt);
+  const unlockAt = Number.isNaN(storedUnlockAt.getTime()) ? new Date(createdAtMs + lockDays * 24 * 60 * 60 * 1000) : storedUnlockAt;
+  const elapsedDays = Math.max(0, Math.min(lockDays, (now - createdAt) / (24 * 60 * 60 * 1000)));
+  const remainingDays = Math.max(0, Math.ceil((unlockAt - now) / (24 * 60 * 60 * 1000)));
+  const accruedRevenue = Number((Number(item.amount) * (dailyReturnRate / 100) * elapsedDays).toFixed(2));
+  const completed = remainingDays <= 0;
+  const withdrawableAmount = completed && !item.transferredToWalletAt ? Number((Number(item.amount) + accruedRevenue).toFixed(2)) : 0;
+  return {
+    id: item._id.toString(),
+    companyId: item.companyId,
+    companyName: item.companyName,
+    amount: Number(item.amount),
+    dailyReturnRate,
+    lockDays,
+    accruedRevenue,
+    amountLocked: remainingDays > 0 ? Number(item.amount) : 0,
+    withdrawableAmount,
+    remainingDays,
+    status: remainingDays > 0 ? "Locked" : item.transferredToWalletAt ? "Transferred" : "Unlocked",
+    unlockAt,
+    createdAt
+  };
+}
+
+app.get("/api/commission/earn", requireAuth, async (req, res) => {
+  const now = new Date();
+  await commissionStocks.updateMany({ active: true, deadlineAt: { $lte: now } }, { $set: { active: false, expiredAt: now, updatedAt: now } });
+  const stockRows = await commissionStocks.find({ active: true, deadlineAt: { $gt: now } }).toArray();
+  const stockByCompany = new Map(stockRows.map(item => [item.companyId, item]));
+  const positions = await commissionOrders.find({ userId: req.user._id }).sort({ createdAt: -1 }).toArray();
+  const orders = positions.map(item => commissionOrderJson(item));
+  return res.json({
+    lockDays: 90,
+    cashWallet: Number(req.user.balance || 0),
+    overallEarnings: Number(orders.reduce((sum, item) => sum + item.accruedRevenue, 0).toFixed(2)),
+    ordersEscrow: Number(orders.reduce((sum, item) => sum + item.amountLocked, 0).toFixed(2)),
+    withdrawableBalance: Number(orders.reduce((sum, item) => sum + item.withdrawableAmount, 0).toFixed(2)),
+    companies: commissionEarnCompanies.filter(item => stockByCompany.has(item.id)).map(item => {
+      const stock = stockByCompany.get(item.id);
+      return { ...item, dailyReturnRate: Number(stock.dailyReturnRate ?? item.dailyReturnRate), lockDays: Number(stock.lockDays || 90), deadlineAt: stock.deadlineAt, perUserLimit: Number(stock.perUserLimit || 1) };
+    }),
+    orders
+  });
+});
+
+// Compatibility alias for app builds created before Commission Earn rename.
+app.get("/api/demo/earn", requireAuth, async (req, res) => {
+  const now = new Date();
+  const stockRows = await commissionStocks.find({ active: true, deadlineAt: { $gt: now } }).toArray();
+  const stockByCompany = new Map(stockRows.map(item => [item.companyId, item]));
+  const positions = await commissionOrders.find({ userId: req.user._id }).sort({ createdAt: -1 }).toArray();
+  const orders = positions.map(item => commissionOrderJson(item));
+  return res.json({ lockDays: 90, cashWallet: Number(req.user.balance || 0), overallEarnings: Number(orders.reduce((sum, item) => sum + item.accruedRevenue, 0).toFixed(2)), ordersEscrow: Number(orders.reduce((sum, item) => sum + item.amountLocked, 0).toFixed(2)), companies: commissionEarnCompanies.filter(item => stockByCompany.has(item.id)).map(item => { const stock=stockByCompany.get(item.id); return { ...item, dailyReturnRate: Number(stock.dailyReturnRate ?? item.dailyReturnRate), lockDays: Number(stock.lockDays || 90), deadlineAt: stock.deadlineAt, perUserLimit: Number(stock.perUserLimit || 1) }; }), orders });
+});
+
+app.post("/api/commission/earn/subscribe", requireAuth, async (req, res) => {
+  const company = commissionEarnCompanies.find(item => item.id === String(req.body?.companyId || ""));
+  const amount = Number(req.body?.amount);
+  if (!company) return res.status(400).json({ message: "Select a valid company." });
+  const now = new Date();
+  const stock = await commissionStocks.findOne({ companyId: company.id, active: true, deadlineAt: { $gt: now } });
+  if (!stock) return res.status(410).json({ message: "This company order is no longer available." });
+  if (!Number.isFinite(amount) || amount < company.min || amount > company.max) return res.status(400).json({ message: `Amount must be between ₱${company.min.toLocaleString()} and ₱${company.max.toLocaleString()}.` });
+  const perUserLimit = Math.max(1, Math.floor(Number(stock.perUserLimit || 1)));
+  const existingOrders = await commissionOrders.countDocuments({ userId: req.user._id, companyId: company.id, stockDeploymentId: stock.deploymentId });
+  if (existingOrders >= perUserLimit) return res.status(409).json({ message: `You have reached this company's ${perUserLimit}-order limit.` });
+  const lockDays = Math.floor(Number(stock.lockDays || 90));
+  const dailyReturnRate = Number(stock.dailyReturnRate ?? company.dailyReturnRate);
+  const unlockAt = new Date(now.getTime() + lockDays * 24 * 60 * 60 * 1000);
+  const updated = await users.findOneAndUpdate(
+    { _id: req.user._id, balance: { $gte: amount } },
+    { $inc: { balance: -amount }, $push: { activities: { type: "commission_order", title: `${company.name} order`, amount: -amount, points: 0, createdAt: now } } },
+    { returnDocument: "after" }
+  );
+  if (!updated) return res.status(400).json({ message: "Insufficient cash wallet balance." });
+  await commissionOrders.insertOne({ userId: req.user._id, accountId: req.user.accountId, companyId: company.id, companyName: company.name, amount, dailyReturnRate, lockDays, stockDeploymentId: stock.deploymentId, stockDeadlineAt: stock.deadlineAt, status: "locked", unlockAt, createdAt: now });
+  await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "commission_order", status: "locked", amount, paymentMethod: "Cash Wallet", description: `${company.name} commission order`, createdAt: now });
+  return res.json({ message: `Order placed with ${company.name}.`, user: publicUser(updated), unlockAt });
+});
+
+app.post("/api/commission/earn/transfer-unlocked", requireAuth, async (req, res) => {
+  const now = new Date();
+  const positions = await commissionOrders.find({ userId: req.user._id, transferredToWalletAt: { $exists: false } }).toArray();
+  const unlockable = positions.map(item => ({ item, summary: commissionOrderJson(item, now) })).filter(entry => entry.summary.withdrawableAmount > 0);
+  const amount = Number(unlockable.reduce((sum, entry) => sum + entry.summary.withdrawableAmount, 0).toFixed(2));
+  if (amount <= 0) return res.status(400).json({ message: "There are no unlocked Commission funds to transfer." });
+  const session = mongoClient.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const ids = unlockable.map(entry => entry.item._id);
+      const changed = await commissionOrders.updateMany({ _id: { $in: ids }, transferredToWalletAt: { $exists: false } }, { $set: { transferredToWalletAt: now, status: "transferred" } }, { session });
+      if (changed.modifiedCount !== ids.length) throw new Error("One or more orders were already transferred. Refresh and try again.");
+      await users.updateOne({ _id: req.user._id }, { $inc: { balance: amount }, $push: { activities: { type: "commission_transfer", title: "Unlocked Commission funds transferred to Cash Wallet", amount, points: 0, createdAt: now } } }, { session });
+      await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "commission_transfer", status: "completed", amount, paymentMethod: "Commission", description: "Unlocked Commission principal and earnings transferred to Cash Wallet", createdAt: now }, { session });
+    });
+  } finally { await session.endSession(); }
+  const updated = await users.findOne({ _id: req.user._id });
+  return res.json({ message: `₱${amount.toFixed(2)} transferred to your Cash Wallet.`, amount, user: publicUser(updated) });
+});
+
+app.post("/api/account/guidance/accept", requireAuth, async (req, res) => {
+  const acceptedAt = new Date();
+  await users.updateOne(
+    { _id: req.user._id, guidanceAcceptedAt: null },
+    { $set: { guidanceAcceptedAt: acceptedAt }, $push: { activities: { type: "guidance", title: "Guidance accepted", amount: 0, points: 0, createdAt: acceptedAt } } }
+  );
+  const updated = await users.findOne({ _id: req.user._id });
+  return res.json({ message: "Guidance accepted.", user: publicUser(updated) });
+});
+
+app.get("/api/referrals", requireAuth, async (req, res) => {
+  const invited = await users.find({ invitedByUserId: req.user._id }).project({ accountId: 1, fullName: 1, activeWorker: 1, membershipLevel: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(100).toArray();
+  const rewards = await referralRewards.find({ inviterUserId: req.user._id }).sort({ createdAt: -1 }).limit(100).toArray();
+  const totalEarned = rewards.reduce((sum, reward) => sum + Number(reward.inviterShare || 0), 0);
+  return res.json({
+    inviteCode: req.user.inviteCode || `CW${req.user.accountId}`,
+    invitedByAccountId: req.user.invitedByAccountId || "",
+    invitedCount: invited.length,
+    totalEarned,
+    invited: invited.map(item => ({ accountId: item.accountId, fullName: item.fullName, workerLevel: Number(item.activeWorker || 0), membershipLevel: item.membershipLevel || "No active membership", joinedAt: item.createdAt })),
+    rewards: rewards.map(item => ({ newMemberAccountId: item.newMemberAccountId, workerLevel: item.workerLevel, inviterShare: item.inviterShare, starterShare: item.starterShare, createdAt: item.createdAt }))
+  });
+});
+
+app.get("/api/partnerships", requireAuth, async (req, res) => {
+  const partnershipX = await users.find({ invitedByUserId: req.user._id }).project({ accountId: 1, fullName: 1, activeWorker: 1, membershipLevel: 1, profileImageDataUrl: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(200).toArray();
+  const xIds = partnershipX.map(item => item._id);
+  const partnershipY = xIds.length ? await users.find({ invitedByUserId: { $in: xIds } }).project({ accountId: 1, fullName: 1, activeWorker: 1, membershipLevel: 1, profileImageDataUrl: 1, invitedByAccountId: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(500).toArray() : [];
+  const yIds = partnershipY.map(item => item._id);
+  const partnershipZ = yIds.length ? await users.find({ invitedByUserId: { $in: yIds } }).project({ accountId: 1, fullName: 1, activeWorker: 1, membershipLevel: 1, profileImageDataUrl: 1, invitedByAccountId: 1, createdAt: 1 }).sort({ createdAt: -1 }).limit(1000).toArray() : [];
+  const activities = Array.isArray(req.user.activities) ? req.user.activities : [];
+  const commissions = activities.filter(item => item.type === "partnership_commission");
+  const earned = commissions.reduce((sum, item) => sum + Number(item.points || 0), 0);
+  const member = item => ({ accountId: item.accountId, fullName: item.fullName, profileImageDataUrl: item.profileImageDataUrl || "", workerLevel: Number(item.activeWorker || 0), membershipLevel: item.membershipLevel || "No applied worker", invitedByAccountId: item.invitedByAccountId || "", joinedAt: item.createdAt });
+  return res.json({
+    inviteCode: req.user.inviteCode || `CW${req.user.accountId}`,
+    earned,
+    totalPartners: partnershipX.length + partnershipY.length + partnershipZ.length,
+    tiers: {
+      x: { label: "Partnership X", rate: 0.45, members: partnershipX.map(member) },
+      y: { label: "Partnership Y", rate: 0.30, members: partnershipY.map(member) },
+      z: { label: "Partnership Z", rate: 0.15, members: partnershipZ.map(member) }
+    },
+    commissions: commissions.slice(-100).reverse().map(item => ({ title: item.title, points: Number(item.points || 0), rate: Number(item.partnershipRate || 0), sourceAccountId: item.sourceAccountId || "", createdAt: item.createdAt }))
+  });
+});
+
+app.get("/api/wallet/withdrawal-status", requireAuth, async (req, res) => {
+  return res.json({
+    withdrawal: await withdrawalStatus(req.user),
+    hasWithdrawalPassword: Boolean(req.user.withdrawalPasswordHash),
+    bankAccount: req.user.withdrawalBank ? {
+      accountName: req.user.withdrawalBank.accountName,
+      bankName: req.user.withdrawalBank.bankName,
+      accountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber)
+    } : null
+  });
+});
+
+app.post("/api/wallet/bank-account", requireAuth, async (req, res) => {
+  const accountName = String(req.body?.accountName || "").trim();
+  const bankName = String(req.body?.bankName || "").trim();
+  const accountNumber = String(req.body?.accountNumber || "").replace(/[\s-]/g, "");
+  if (accountName.length < 3) return res.status(400).json({ message: "Enter the bank account holder's complete name." });
+  if (bankName.length < 2) return res.status(400).json({ message: "Select a valid bank." });
+  if (!/^\d{6,20}$/.test(accountNumber)) return res.status(400).json({ message: "Enter a valid bank account number." });
+  const now = new Date();
+  await users.updateOne({ _id: req.user._id }, { $set: { withdrawalBank: { accountName, bankName, accountNumber, updatedAt: now }, updatedAt: now } });
+  return res.json({ message: "Personal withdrawal bank account saved.", bankAccount: { accountName, bankName, accountNumberMasked: maskBankAccount(accountNumber) } });
+});
+
+app.post("/api/wallet/withdrawal-password", requireAuth, async (req, res) => {
+  const password = String(req.body?.password || "");
+  const confirmPassword = String(req.body?.confirmPassword || "");
+  if (!/^\d{6}$/.test(password)) return res.status(400).json({ message: "Withdrawal password must be exactly 6 digits." });
+  if (password !== confirmPassword) return res.status(400).json({ message: "Withdrawal passwords do not match." });
+  if (req.user.withdrawalPasswordHash) return res.status(409).json({ message: "A withdrawal password is already set." });
+  await users.updateOne({ _id: req.user._id }, { $set: { withdrawalPasswordHash: await bcrypt.hash(password, 12), withdrawalPasswordSetAt: new Date(), updatedAt: new Date() } });
+  return res.json({ message: "Withdrawal password set successfully." });
+});
+
+app.get("/api/transactions", requireAuth, async (req, res) => {
+  const items = await transactions.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(100).toArray();
+  return res.json({ transactions: items.map(item => ({ id: item._id.toString(), type: item.type, status: item.status, amount: item.amount, paymentMethod: item.paymentMethod, description: item.description, createdAt: item.createdAt })) });
+});
+
+app.get("/api/wallet/withdrawals", requireAuth, async (req, res) => {
+  const items = await transactions.find({ userId: req.user._id, type: "withdrawal" }).sort({ createdAt: -1 }).limit(100).toArray();
+  return res.json({ withdrawals: items.map(item => ({
+    id: item._id.toString(), status: item.status || "pending", amount: Math.abs(Number(item.amount || 0)),
+    paymentMethod: item.paymentMethod || "GCash", description: item.description || "Withdrawal request",
+    createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || ""
+  })) });
+});
+
+app.get("/api/account/analytics", requireAuth, async (req, res) => {
+  const now = new Date();
+  const startOfToday = new Date(now); startOfToday.setHours(0, 0, 0, 0);
+  const startOfYesterday = new Date(startOfToday); startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+  const startOfWeek = new Date(startOfToday); startOfWeek.setDate(startOfWeek.getDate() - 6);
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const activities = Array.isArray(req.user.activities) ? req.user.activities : [];
+  const sumPoints = (from, to = null) => activities.reduce((sum, item) => {
+    const createdAt = new Date(item.createdAt || 0);
+    return createdAt >= from && (!to || createdAt < to) ? sum + Number(item.points || 0) : sum;
+  }, 0);
+  const totalPointsEarned = activities.reduce((sum, item) => sum + Math.max(0, Number(item.points || 0)), 0);
+  const completedTasks = activities.filter(item => Number(item.points || 0) > 0).length;
+  const deposits = await transactions.aggregate([
+    { $match: { userId: req.user._id, type: "topup", status: "completed" } },
+    { $group: { _id: null, total: { $sum: "$amount" } } }
+  ]).toArray();
+  return res.json({ analytics: {
+    todayPoints: sumPoints(startOfToday),
+    yesterdayPoints: sumPoints(startOfYesterday, startOfToday),
+    weekPoints: sumPoints(startOfWeek),
+    monthPoints: sumPoints(startOfMonth),
+    totalPointsEarned,
+    completedTasks,
+    walletBalance: Number(req.user.balance || 0),
+    totalDeposits: Number(deposits[0]?.total || 0)
+  }});
+});
+
+app.post("/api/account/earnings/convert", requireAuth, async (req, res) => {
+  const amount = Number(req.body?.amount);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) return res.status(400).json({ message: "Enter a valid amount to convert." });
+  const now = new Date();
+  const updated = await users.findOneAndUpdate(
+    { _id: req.user._id, points: { $gte: amount } },
+    {
+      $inc: { points: -amount, balance: amount },
+      $push: { activities: { type: "earnings_conversion", title: "Earnings converted to cash wallet", points: -amount, amount, createdAt: now } }
+    },
+    { returnDocument: "after" }
+  );
+  if (!updated) return res.status(400).json({ message: "Insufficient earnings points." });
+  await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "earnings_conversion", status: "completed", amount, paymentMethod: "Earnings", description: `${amount.toFixed(2)} earnings points converted to cash wallet`, createdAt: now });
+  return res.json({ message: `Converted ${amount.toFixed(2)} earnings points to ₱${amount.toFixed(2)} cash wallet.`, user: publicUser(updated) });
+});
+
+app.get("/api/account/completed-tasks", requireAuth, async (req, res) => {
+  const activities = Array.isArray(req.user.activities) ? req.user.activities : [];
+  const completed = activities
+    .filter(item => Number(item.points || 0) > 0 && ["captcha_encoding", "captcha_practice", "reward", "survey_task", "annotation_task"].includes(String(item.type)))
+    .slice(-100)
+    .reverse()
+    .map(item => ({ title: item.title || "Completed task", taskType: item.type || "task", points: Number(item.points || 0), answer: item.answer || "", taskId: item.taskId || "", completedAt: item.createdAt }));
+  return res.json({ completed });
+});
+
+app.get("/api/notifications", requireAuth, async (req, res) => {
+  const items = await notifications.find({ $or: [{ userId: req.user._id }, { userId: null }] }).sort({ createdAt: -1 }).limit(100).toArray();
+  return res.json({ notifications: items.map(item => ({
+    id: item._id.toString(), senderType: item.senderType || "system", title: item.title,
+    message: item.message, imageDataUrl: item.imageDataUrl || "", read: Boolean(item.readAt), createdAt: item.createdAt
+  })) });
+});
+
+app.get("/api/support/messages", requireAuth, async (req, res) => {
+  const items = await supportMessages.find({ userId: req.user._id }).sort({ createdAt: 1 }).limit(200).toArray();
+  return res.json({ messages: items.map(item => ({ id: item._id.toString(), senderType: item.senderType, message: item.message, createdAt: item.createdAt })) });
+});
+
+app.post("/api/support/messages", requireAuth, async (req, res) => {
+  const message = String(req.body?.message || "").trim();
+  if (!message || message.length > 2000) return res.status(400).json({ message: "Message must contain 1 to 2000 characters." });
+  const item = { userId: req.user._id, accountId: req.user.accountId, senderType: "member", message, createdAt: new Date() };
+  const result = await supportMessages.insertOne(item);
+  await notifications.insertOne({ userId: req.user._id, accountId: req.user.accountId, senderType: "system", title: "Support request received", message: "Support team received your message.", readAt: null, createdAt: new Date() });
+  return res.status(201).json({ item: { id: result.insertedId.toString(), senderType: item.senderType, message: item.message, createdAt: item.createdAt } });
+});
+
+app.post("/api/notifications/:id/read", requireAuth, async (req, res) => {
+  try {
+    const id = new (require("mongodb").ObjectId)(req.params.id);
+    await notifications.updateOne({ _id: id, $or: [{ userId: req.user._id }, { userId: null }] }, { $set: { readAt: new Date() } });
+    return res.json({ message: "Notification marked as read." });
+  } catch (_) { return res.status(400).json({ message: "Invalid notification." }); }
+});
+
+// Temporary localhost administration endpoint. Set ADMIN_API_KEY in .env and
+// send it as X-Admin-Key. Omit accountId to notify every account.
+app.post("/api/admin/notifications", requireAdminAccess, async (req, res) => {
+  const title = String(req.body?.title || "").trim();
+  const message = String(req.body?.message || "").trim();
+  if (!title || !message) return res.status(400).json({ message: "Title and message are required." });
+  const imageDataUrl = String(req.body?.imageDataUrl || "");
+  if (imageDataUrl && (!/^data:image\/png;base64,[a-z0-9+/=]+$/i.test(imageDataUrl) || imageDataUrl.length > 2_200_000)) {
+    return res.status(400).json({ message: "Announcement image must be a PNG smaller than 1.5 MB." });
+  }
+  let userId = null; let accountId = null;
+  if (req.body?.accountId) {
+    const user = await users.findOne({ accountId: String(req.body.accountId) });
+    if (!user) return res.status(404).json({ message: "Account not found." });
+    userId = user._id; accountId = user.accountId;
+  }
+  const result = await notifications.insertOne({ userId, accountId, senderType: "admin", title, message, imageDataUrl, readAt: null, createdAt: new Date() });
+  return res.status(201).json({ id: result.insertedId.toString(), message: "Notification sent." });
+});
+
+app.get("/api/admin/notifications", requireAuth, requireAdmin, async (_req, res) => {
+  const items = await notifications.find({ senderType: "admin" }).sort({ createdAt: -1 }).limit(200).toArray();
+  return res.json({ announcements: items.map(item => ({ id: item._id.toString(), accountId: item.accountId || "", title: item.title, message: item.message, imageDataUrl: item.imageDataUrl || "", createdAt: item.createdAt })) });
+});
+
+app.delete("/api/admin/notifications/:id", requireAuth, requireAdmin, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid announcement." }); }
+  const result = await notifications.deleteOne({ _id: id, senderType: "admin" });
+  if (!result.deletedCount) return res.status(404).json({ message: "Announcement not found." });
+  return res.json({ message: "Published announcement removed." });
+});
+
+app.get("/api/admin/support/conversations", requireAdminAccess, async (req, res) => {
+  const conversations = await supportMessages.aggregate([
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: "$userId", accountId: { $first: "$accountId" }, lastMessage: { $first: "$message" }, lastSender: { $first: "$senderType" }, updatedAt: { $first: "$createdAt" } } },
+    { $sort: { updatedAt: -1 } }
+  ]).toArray();
+  const userIds = conversations.map(item => item._id);
+  const names = await users.find({ _id: { $in: userIds } }).project({ fullName: 1, accountId: 1 }).toArray();
+  const byId = new Map(names.map(user => [user._id.toString(), user]));
+  return res.json({ conversations: conversations.map(item => ({ userId: item._id.toString(), accountId: item.accountId, fullName: byId.get(item._id.toString())?.fullName || "Member", lastMessage: item.lastMessage, lastSender: item.lastSender, updatedAt: item.updatedAt })) });
+});
+
+app.get("/api/admin/support/conversations/:accountId", requireAdminAccess, async (req, res) => {
+  const user = await users.findOne({ accountId: String(req.params.accountId) });
+  if (!user) return res.status(404).json({ message: "Account not found." });
+  const items = await supportMessages.find({ userId: user._id }).sort({ createdAt: 1 }).limit(200).toArray();
+  return res.json({ account: publicUser(user), messages: items.map(item => ({ id: item._id.toString(), senderType: item.senderType, message: item.message, createdAt: item.createdAt })) });
+});
+
+app.post("/api/admin/support/reply", requireAdminAccess, async (req, res) => {
+  const accountId = String(req.body?.accountId || "");
+  const message = String(req.body?.message || "").trim();
+  const user = await users.findOne({ accountId });
+  if (!user) return res.status(404).json({ message: "Account not found." });
+  if (!message || message.length > 2000) return res.status(400).json({ message: "Message must contain 1 to 2000 characters." });
+  const createdAt = new Date();
+  await supportMessages.insertOne({ userId: user._id, accountId, senderType: "support", message, createdAt });
+  await notifications.insertOne({ userId: user._id, accountId, senderType: "support", title: "New support reply", message, readAt: null, createdAt });
+  return res.status(201).json({ message: "Support reply sent." });
+});
+
+function commissionStockJson(stock) {
+  const company = commissionEarnCompanies.find(item => item.id === stock.companyId);
+  return {
+    id: stock._id.toString(), companyId: stock.companyId, companyName: company?.name || stock.companyId,
+    active: Boolean(stock.active), perUserLimit: Number(stock.perUserLimit || 1), dailyReturnRate: Number(stock.dailyReturnRate ?? company?.dailyReturnRate ?? 0), lockDays: Number(stock.lockDays || 90),
+    deadlineAt: stock.deadlineAt || null, deployedAt: stock.deployedAt || null, expiredAt: stock.expiredAt || null
+  };
+}
+
+app.get("/api/admin/commission-stocks", requireAuth, requireAdmin, async (_req, res) => {
+  const now = new Date();
+  await commissionStocks.updateMany({ active: true, deadlineAt: { $lte: now } }, { $set: { active: false, expiredAt: now, updatedAt: now } });
+  const stocks = await commissionStocks.find({}).toArray();
+  const byCompany = new Map(stocks.map(item => [item.companyId, item]));
+  return res.json({ companies: commissionEarnCompanies.map(company => ({ ...company, stock: byCompany.has(company.id) ? commissionStockJson(byCompany.get(company.id)) : null })) });
+});
+
+app.put("/api/admin/commission-stocks/:companyId", requireAuth, requireAdmin, async (req, res) => {
+  const company = commissionEarnCompanies.find(item => item.id === String(req.params.companyId));
+  if (!company) return res.status(404).json({ message: "Company not found." });
+  const active = Boolean(req.body?.active);
+  const perUserLimit = Math.floor(Number(req.body?.perUserLimit));
+  const deadlineAt = new Date(req.body?.deadlineAt);
+  const dailyReturnRate = Number(req.body?.dailyReturnRate);
+  const lockDays = Math.floor(Number(req.body?.lockDays));
+  if (!Number.isInteger(perUserLimit) || perUserLimit < 1 || perUserLimit > 100) return res.status(400).json({ message: "Per-user order limit must be from 1 to 100." });
+  if (!Number.isFinite(dailyReturnRate) || dailyReturnRate <= 0 || dailyReturnRate > 100) return res.status(400).json({ message: "Daily return rate must be greater than 0% and no more than 100%." });
+  if (!Number.isInteger(lockDays) || lockDays < 1 || lockDays > 3650) return res.status(400).json({ message: "Lock period must be from 1 to 3,650 days." });
+  if (active && Number.isNaN(deadlineAt.getTime())) return res.status(400).json({ message: "Choose a valid deployment deadline." });
+  if (active && deadlineAt <= new Date()) return res.status(400).json({ message: "Deadline must be in the future." });
+  const now = new Date();
+  const update = active
+    ? { companyId: company.id, active: true, perUserLimit, dailyReturnRate, lockDays, deadlineAt, deploymentId: new ObjectId().toString(), deployedAt: now, expiredAt: null, updatedAt: now, updatedBy: req.user._id }
+    : { companyId: company.id, active: false, perUserLimit, dailyReturnRate, lockDays, deadlineAt: null, removedAt: now, updatedAt: now, updatedBy: req.user._id };
+  await commissionStocks.updateOne({ companyId: company.id }, { $set: update, $setOnInsert: { createdAt: now } }, { upsert: true });
+  const saved = await commissionStocks.findOne({ companyId: company.id });
+  return res.json({ message: active ? `${company.name} deployed for orders.` : `${company.name} removed from available orders.`, stock: commissionStockJson(saved) });
+});
+
+app.get("/api/admin/overview", requireAuth, requireAdmin, async (_req, res) => {
+  const [memberCount, restrictedCount, bannedCount, pendingWithdrawals, flow] = await Promise.all([
+    users.countDocuments({ role: { $ne: "Admin" } }),
+    users.countDocuments({ restricted: true }),
+    users.countDocuments({ banned: true }),
+    transactions.countDocuments({ type: "withdrawal", status: "pending" }),
+    transactions.aggregate([{ $group: {
+      _id: null,
+      topups: { $sum: { $cond: [{ $and: [{ $eq: ["$type", "topup"] }, { $eq: ["$status", "completed"] }] }, "$amount", 0] } },
+      withdrawals: { $sum: { $cond: [{ $and: [{ $eq: ["$type", "withdrawal"] }, { $eq: ["$status", "completed"] }] }, { $abs: "$amount" }, 0] } }
+    }}]).toArray()
+  ]);
+  return res.json({ overview: { memberCount, restrictedCount, bannedCount, pendingWithdrawals, totalTopups: Number(flow[0]?.topups || 0), totalWithdrawals: Number(flow[0]?.withdrawals || 0) } });
+});
+
+app.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
+  const query = String(req.query.q || "").trim();
+  const accountId = query.replace(/^CW/i, "");
+  const match = query ? { $or: [{ accountId }, { username: { $regex: query, $options: "i" } }, { usernameLower: query.toLowerCase() }, { fullName: { $regex: query, $options: "i" } }, { phone: { $regex: query.replace(/[^0-9+]/g, "") } }] } : {};
+  const items = await users.find(match).sort({ createdAt: -1 }).limit(200).toArray();
+  return res.json({ users: items.map(safeUserSummary) });
+});
+
+app.get("/api/admin/users/:accountId/cashflow", requireAuth, requireAdmin, async (req, res) => {
+  const user = await users.findOne({ accountId: String(req.params.accountId) });
+  if (!user) return res.status(404).json({ message: "Account not found." });
+  const items = await transactions.find({ userId: user._id }).sort({ createdAt: -1 }).limit(200).toArray();
+  const totals = items.reduce((sum, item) => {
+    const amount = Number(item.amount || 0);
+    if (item.type === "topup" && item.status === "completed") sum.topups += Math.abs(amount);
+    if (item.type === "withdrawal" && item.status === "completed") sum.withdrawals += Math.abs(amount);
+    if (item.type.includes("referral")) sum.referrals += amount;
+    return sum;
+  }, { topups: 0, withdrawals: 0, referrals: 0 });
+  return res.json({ user: safeUserSummary(user), totals, transactions: items.map(item => ({ id: item._id.toString(), type: item.type, status: item.status, amount: item.amount, description: item.description, createdAt: item.createdAt })) });
+});
+
+app.patch("/api/admin/users/:accountId/balance", requireAuth, requireAdmin, async (req, res) => {
+  const balance = Number(req.body?.balance);
+  if (!Number.isFinite(balance) || balance < 0 || balance > 1000000000) return res.status(400).json({ message: "Enter a valid non-negative balance." });
+  const user = await users.findOne({ accountId: String(req.params.accountId) });
+  if (!user) return res.status(404).json({ message: "Account not found." });
+  if (user.role === "Admin" && user._id.toString() !== req.user._id.toString()) return res.status(403).json({ message: "Another administrator cannot be edited." });
+  const previous = Number(user.balance || 0); const now = new Date();
+  const updated = await users.findOneAndUpdate({ _id: user._id }, { $set: { balance, updatedAt: now }, $push: { activities: { type: "admin_balance_adjustment", title: "Balance adjusted by administrator", amount: balance - previous, points: 0, createdAt: now } } }, { returnDocument: "after" });
+  await transactions.insertOne({ userId: user._id, accountId: user.accountId, type: "admin_balance_adjustment", status: "completed", amount: balance - previous, paymentMethod: "Admin", description: `Balance adjusted from ${previous.toFixed(2)} to ${balance.toFixed(2)}`, createdAt: now });
+  return res.json({ message: "Balance updated.", user: safeUserSummary(updated) });
+});
+
+app.patch("/api/admin/users/:accountId/access", requireAuth, requireAdmin, async (req, res) => {
+  const user = await users.findOne({ accountId: String(req.params.accountId) });
+  if (!user) return res.status(404).json({ message: "Account not found." });
+  if (user.role === "Admin") return res.status(403).json({ message: "Administrator access cannot be restricted here." });
+  const action = String(req.body?.action || "").trim().toLowerCase();
+  const reason = String(req.body?.reason || "").trim().slice(0, 500);
+  const now = new Date();
+  const state = action === "restrict" ? { restricted: true, banned: false } : action === "ban" ? { restricted: false, banned: true } : action === "restore" ? { restricted: false, banned: false } : null;
+  if (!state) return res.status(400).json({ message: "Action must be restrict, ban, or restore." });
+  if ((action === "restrict" || action === "ban") && !reason) return res.status(400).json({ message: `A ${action} reason is required.` });
+  const accessReason = action === "restore" ? "" : reason;
+  const update = { ...state, restrictionReason: action === "restrict" ? accessReason : "", banReason: action === "ban" ? accessReason : "", accessUpdatedAt: now, updatedAt: now };
+  const updated = await users.findOneAndUpdate({ _id: user._id }, { $set: update }, { returnDocument: "after" });
+  return res.json({ message: action === "restore" ? "Account access restored." : action === "ban" ? "Account banned." : "Account restricted.", user: safeUserSummary(updated) });
+});
+
+app.get("/api/admin/withdrawals", requireAuth, requireAdmin, async (_req, res) => {
+  const items = await transactions.find({ type: "withdrawal" }).sort({ createdAt: -1 }).limit(200).toArray();
+  const accountIds = [...new Set(items.map(item => item.accountId).filter(Boolean))];
+  const owners = await users.find({ accountId: { $in: accountIds } }).project({ accountId: 1, fullName: 1 }).toArray();
+  const names = new Map(owners.map(item => [item.accountId, item.fullName]));
+  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+});
+
+app.patch("/api/admin/withdrawals/:id", requireAuth, requireAdmin, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid withdrawal." }); }
+  const decision = String(req.body?.decision || "").toLowerCase(); const rejectionReason = String(req.body?.reason || "").trim().slice(0, 500);
+  if (!["completed", "rejected"].includes(decision)) return res.status(400).json({ message: "Decision must be completed or rejected." });
+  const session = mongoClient.startSession(); let owner; let amount = 0; let reviewed = false;
+  try {
+    await session.withTransaction(async () => {
+      const item = await transactions.findOne({ _id: id, type: "withdrawal" }, { session });
+      if (!item) throw new Error("Withdrawal not found.");
+      if (item.status !== "pending") throw new Error("This withdrawal was already reviewed.");
+      amount = Math.abs(Number(item.amount || 0)); owner = await users.findOne({ _id: item.userId }, { session });
+      const statusUpdate = await transactions.updateOne({ _id: id, status: "pending" }, { $set: { status: decision, reviewedAt: new Date(), reviewedBy: req.user._id, rejectionReason: decision === "rejected" ? rejectionReason : "" } }, { session });
+      if (statusUpdate.modifiedCount !== 1) throw new Error("This withdrawal was already reviewed.");
+      if (decision === "rejected") await users.updateOne({ _id: item.userId }, { $inc: { balance: amount }, $push: { activities: { type: "withdrawal_refund", title: "Rejected withdrawal refunded", amount, points: 0, createdAt: new Date() } } }, { session });
+      await notifications.insertOne({ userId: item.userId, accountId: item.accountId, senderType: "admin", title: `Withdrawal ${decision}`, message: decision === "completed" ? `Your GCash withdrawal of ₱${amount.toFixed(2)} was completed.` : `Your withdrawal of ₱${amount.toFixed(2)} was rejected and returned to your cash wallet.${rejectionReason ? ` Reason: ${rejectionReason}` : ""}`, readAt: null, createdAt: new Date() }, { session });
+      reviewed = true;
+    });
+    if (!reviewed) return res.status(409).json({ message: "This withdrawal was already reviewed." });
+    return res.json({ message: `Withdrawal marked ${decision}.`, accountId: owner?.accountId, amount });
+  } catch (error) { return res.status(400).json({ message: error.message || "Could not review withdrawal." }); }
+  finally { await session.endSession(); }
+});
+
+// Optional website generator. Android task claims self-generate when queue is empty.
+app.post("/api/simulator/captcha", async (req, res) => {
+  const generationKey = String(req.body?.requestId || require("crypto").randomUUID()).slice(0, 120);
+  const duplicate = await captchaTasks.findOne({ generationKey });
+  if (duplicate) return res.json({ task: { id: duplicate._id.toString(), imageUrl: `/api/simulator/captcha/${duplicate._id.toString()}/image`, status: duplicate.status, rewardPoints: duplicate.rewardPoints, createdAt: duplicate.createdAt }, deduplicated: true });
+  const { answer, imageDataUrl } = await createCaptchaArtwork();
+  const now = new Date();
+  const task = {
+    source: "self_generated",
+    generationKey,
+    workerLevel: 1,
+    title: "Captcha Encoding",
+    imageDataUrl,
+    imageFormat: "image/png",
+    answerHash: await bcrypt.hash(answer, 8),
+    status: "pending",
+    rewardPoints: 5,
+    createdAt: now,
+    expiresAt: new Date(now.getTime() + 15 * 60 * 1000)
+  };
+  try {
+    const result = await captchaTasks.insertOne(task);
+    return res.status(201).json({ task: { id: result.insertedId.toString(), imageUrl: `/api/simulator/captcha/${result.insertedId.toString()}/image`, status: task.status, rewardPoints: task.rewardPoints, createdAt: task.createdAt }, deduplicated: false });
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+    const existing = await captchaTasks.findOne({ generationKey });
+    return res.json({ task: { id: existing._id.toString(), imageUrl: `/api/simulator/captcha/${existing._id.toString()}/image`, status: existing.status, rewardPoints: existing.rewardPoints, createdAt: existing.createdAt }, deduplicated: true });
+  }
+});
+
+app.get("/api/simulator/captcha/:id/image", async (req, res) => {
+  try {
+    const item = await captchaTasks.findOne(
+      { _id: new (require("mongodb").ObjectId)(req.params.id) },
+      { projection: { imageDataUrl: 1, expiresAt: 1 } }
+    );
+    if (!item?.imageDataUrl || item.expiresAt <= new Date()) return res.status(404).send("Challenge image expired.");
+    const base64 = item.imageDataUrl.replace(/^data:image\/png;base64,/, "");
+    res.set("Cache-Control", "private, max-age=60");
+    return res.type("png").send(Buffer.from(base64, "base64"));
+  } catch (_) {
+    return res.status(400).send("Invalid challenge image.");
+  }
+});
+
+app.get("/api/simulator/captcha/:id", async (req, res) => {
+  try {
+    const item = await captchaTasks.findOne({ _id: new (require("mongodb").ObjectId)(req.params.id) });
+    if (!item) return res.status(404).json({ message: "Practice task not found." });
+    return res.json({ task: { id: item._id.toString(), imageUrl: `/api/simulator/captcha/${item._id.toString()}/image`, status: item.status, correct: item.correct, submittedAt: item.submittedAt, solverAccountId: item.solverAccountId } });
+  } catch (_) { return res.status(400).json({ message: "Invalid task ID." }); }
+});
+
+app.get("/api/tasks/captcha/next", requireAuth, async (req, res) => {
+  if (![1, 2, 3].includes(Number(req.user.activeWorker || 0))) return res.status(403).json({ message: "Captcha Encoder Worker 1, 2, or 3 must be active." });
+  try {
+    const result = await claimCaptchaForUser(req.user);
+    if (result.error) return res.status(result.status).json({ message: result.error, remaining: result.remaining });
+    return res.json({ task: captchaTaskJson(result.task, result.remaining), remaining: result.remaining, dailyMax: result.dailyMax || captchaDailyMax(req.user.activeWorker) });
+  } catch (error) {
+    console.error("captcha claim", error);
+    return res.status(500).json({ message: "Unable to claim a practice challenge." });
+  }
+});
+
+app.post("/api/tasks/captcha/:id/submit", requireAuth, async (req, res) => {
+  try {
+    const id = new (require("mongodb").ObjectId)(req.params.id);
+    const task = await captchaTasks.findOne({ _id: id, assignedTo: req.user._id, status: "assigned" });
+    if (!task) return res.status(404).json({ message: "Assigned practice task not found or already submitted." });
+    const correct = await bcrypt.compare(String(req.body?.answer || "").trim().toUpperCase(), task.answerHash);
+    const rewardPoints = correct ? captchaReward(req.user.activeWorker) : 0;
+    const dayKey = task.dayKey || captchaDayKey();
+    const session = mongoClient.startSession();
+    let submitted = false;
+    try {
+      await session.withTransaction(async () => {
+        const completed = await captchaTasks.findOneAndUpdate(
+          { _id: id, assignedTo: req.user._id, status: "assigned" },
+          { $set: { status: "completed", correct, submittedAnswer: String(req.body?.answer || "").trim().toUpperCase(), submittedAt: new Date() } },
+          { returnDocument: "after", session }
+        );
+        if (!completed) return;
+        submitted = true;
+        await captchaUsage.updateOne({ userId: req.user._id, dayKey }, { $inc: { completed: 1 }, $set: { updatedAt: new Date() } }, { session });
+        if (rewardPoints > 0) {
+          await users.updateOne({ _id: req.user._id }, { $inc: { points: rewardPoints }, $push: { activities: { type: "captcha_encoding", title: "Captcha Encoding", points: rewardPoints, amount: 0, answer: String(req.body?.answer || "").trim().toUpperCase(), taskId: id.toString(), correct: true, createdAt: new Date() } } }, { session });
+          await awardPartnershipCommission(req.user, rewardPoints, id.toString(), "Captcha Encoding", session);
+        }
+      });
+    } finally { await session.endSession(); }
+    if (!submitted) return res.status(409).json({ message: "This answer was already submitted." });
+    const updated = await users.findOne({ _id: req.user._id });
+    const next = await claimCaptchaForUser(updated);
+    const usage = await captchaUsage.findOne({ userId: req.user._id, dayKey });
+    const dailyMax = captchaDailyMax(updated.activeWorker);
+    const remaining = Math.max(0, dailyMax - Number(usage?.completed || 0));
+    return res.json({
+      message: correct ? `Correct. You earned ${rewardPoints} points.` : "Incorrect answer. No points awarded.",
+      correct,
+      user: publicUser(updated),
+      remaining,
+      dailyMax,
+      nextTask: next.task ? captchaTaskJson(next.task, remaining) : null,
+      nextMessage: next.error || (remaining === 0 ? "Daily CAPTCHA limit reached." : "")
+    });
+  } catch (error) {
+    console.error("captcha submit", error);
+    return res.status(400).json({ message: "Invalid practice task." });
+  }
+});
+
+function surveyDailyLimit(workerLevel) {
+  return ({ 4: 12, 5: 16, 6: 20 })[Number(workerLevel)] || 0;
+}
+
+function surveyReward(workerLevel) {
+  return ({ 4: 73.27, 5: 148.34, 6: 320.41 })[Number(workerLevel)] || 0;
+}
+
+function surveyQuestionJson(item, answeredToday, dailyMax, unansweredTotal) {
+  return { id: item._id.toString(), questionKey: item.questionKey, category: item.category, prompt: item.prompt, options: item.options, rewardPoints: surveyReward(item.workerLevel), answeredToday, dailyMax, remainingToday: Math.max(0, dailyMax - answeredToday), unansweredTotal };
+}
+
+async function nextSurveyForUser(user) {
+  const dailyMax = surveyDailyLimit(user.activeWorker);
+  const dayKey = captchaDayKey();
+  const answeredToday = await surveyAnswers.countDocuments({ userId: user._id, dayKey });
+  if (!dailyMax) return { status: 403, error: "Survey Worker 4, 5, or 6 must be active.", answeredToday, dailyMax: 0, unansweredTotal: 0 };
+  const answeredIds = await surveyAnswers.distinct("questionId", { userId: user._id });
+  const unansweredTotal = await surveyQuestions.countDocuments({ active: true, _id: { $nin: answeredIds } });
+  if (answeredToday >= dailyMax) return { status: 429, error: "Daily survey limit reached.", answeredToday, dailyMax, unansweredTotal };
+  const question = await surveyQuestions.findOne({ active: true, _id: { $nin: answeredIds } }, { sort: { sortOrder: 1 } });
+  if (!question) return { status: 404, error: "You answered all available survey questions.", answeredToday, dailyMax, unansweredTotal: 0 };
+  question.workerLevel = Number(user.activeWorker);
+  return { question, answeredToday, dailyMax, unansweredTotal };
+}
+
+app.get("/api/tasks/survey/next", requireAuth, async (req, res) => {
+  const result = await nextSurveyForUser(req.user);
+  if (result.error) return res.status(result.status).json({ message: result.error, answeredToday: result.answeredToday, dailyMax: result.dailyMax, remainingToday: Math.max(0, result.dailyMax - result.answeredToday), unansweredTotal: result.unansweredTotal });
+  return res.json({ question: surveyQuestionJson(result.question, result.answeredToday, result.dailyMax, result.unansweredTotal) });
+});
+
+app.post("/api/tasks/survey/:id/answer", requireAuth, async (req, res) => {
+  if (![4, 5, 6].includes(Number(req.user.activeWorker || 0))) return res.status(403).json({ message: "Survey Worker 4, 5, or 6 must be active." });
+  let questionId; try { questionId = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid survey question." }); }
+  const question = await surveyQuestions.findOne({ _id: questionId, active: true });
+  if (!question) return res.status(404).json({ message: "Survey question not found." });
+  const answer = String(req.body?.answer || "").trim();
+  if (!question.options.includes(answer)) return res.status(400).json({ message: "Select one of the available answers." });
+  const dailyMax = surveyDailyLimit(req.user.activeWorker); const dayKey = captchaDayKey(); const rewardPoints = surveyReward(req.user.activeWorker); const now = new Date();
+  const session = mongoClient.startSession(); let accepted = false;
+  try {
+    await session.withTransaction(async () => {
+      const answeredToday = await surveyAnswers.countDocuments({ userId: req.user._id, dayKey }, { session });
+      if (answeredToday >= dailyMax) throw Object.assign(new Error("Daily survey limit reached."), { status: 429 });
+      try {
+        await surveyAnswers.insertOne({ userId: req.user._id, accountId: req.user.accountId, questionId, questionKey: question.questionKey, category: question.category, prompt: question.prompt, answer, workerLevel: Number(req.user.activeWorker), rewardPoints, dayKey, answeredAt: now }, { session });
+      } catch (error) {
+        if (error?.code === 11000) throw Object.assign(new Error("You already answered this question."), { status: 409 });
+        throw error;
+      }
+      await users.updateOne({ _id: req.user._id }, { $inc: { points: rewardPoints }, $push: { activities: { type: "survey_task", title: question.prompt, points: rewardPoints, amount: 0, answer, taskId: questionId.toString(), createdAt: now } } }, { session });
+      await awardPartnershipCommission(req.user, rewardPoints, questionId.toString(), question.prompt, session);
+      accepted = true;
+    });
+    if (!accepted) return res.status(409).json({ message: "Survey answer was not recorded." });
+    const updated = await users.findOne({ _id: req.user._id });
+    const next = await nextSurveyForUser(updated);
+    return res.json({ message: `Survey saved. You earned ${rewardPoints.toFixed(2)} points.`, user: publicUser(updated), answeredToday: next.answeredToday, dailyMax: next.dailyMax, remainingToday: Math.max(0, next.dailyMax - next.answeredToday), unansweredTotal: next.unansweredTotal, nextQuestion: next.question ? surveyQuestionJson(next.question, next.answeredToday, next.dailyMax, next.unansweredTotal) : null, nextMessage: next.error || "" });
+  } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not save survey answer." }); }
+  finally { await session.endSession(); }
+});
+
+app.post("/api/workers/apply", requireAuth, async (req, res) => {
+  const workerLevel = Number(req.body?.workerLevel);
+  const plan = workerPlans[workerLevel];
+  if (!plan) return res.status(400).json({ message: "Select a valid Worker role." });
+  if (Number(req.user.activeWorker || 0) === workerLevel) {
+    return res.status(409).json({ code: "MEMBERSHIP_ALREADY_ACTIVE", message: `You are already assigned to the ${plan.membershipLevel} Worker role.` });
+  }
+
+  const appliedAt = new Date();
+  const membershipExpiresAt = new Date(appliedAt.getTime() + 360 * 24 * 60 * 60 * 1000);
+  const session = mongoClient.startSession();
+  let referralApplied = false;
+  try {
+    await session.withTransaction(async () => {
+      // Keep balance debit, membership activation, and ledger record atomic. The
+      // balance condition prevents duplicate concurrent requests from overspending.
+      const debit = await users.updateOne(
+        { _id: req.user._id, balance: { $gte: plan.cost } },
+        { $inc: { balance: -plan.cost }, $set: { activeWorker: workerLevel, membershipLevel: plan.membershipLevel, workerPurchasedAt: appliedAt, membershipExpiresAt }, $push: { activities: { type: "worker_application", title: `Applied: ${plan.membershipLevel}`, amount: -plan.cost, points: 0, createdAt: appliedAt } } },
+        { session }
+      );
+      if (debit.modifiedCount !== 1) {
+        const error = new Error("Insufficient Cash Wallet balance. Deposit funds before applying for this worker.");
+        error.status = 400;
+        throw error;
+      }
+      const transaction = { userId: req.user._id, accountId: req.user.accountId, type: "worker_application", status: "completed", amount: -plan.cost, paymentMethod: "Cash Wallet", description: `Applied for ${plan.membershipLevel} using Cash Wallet`, workerLevel, createdAt: appliedAt };
+      await transactions.insertOne(transaction, { session });
+
+      // Reward applies once, when referred member buys first membership.
+      if (req.user.invitedByUserId && !req.user.referralRewardAppliedAt) {
+        const rewardId = `${req.user._id.toString()}:first-membership`;
+        try {
+          await referralRewards.insertOne({ rewardId, inviterUserId: req.user.invitedByUserId, newMemberUserId: req.user._id, newMemberAccountId: req.user.accountId, workerLevel, referralPercent: plan.referralPercent, referralBonus: plan.referralBonus, starterShare: plan.starterShare, inviterShare: plan.inviterShare, createdAt: appliedAt }, { session });
+          await users.updateOne({ _id: req.user._id }, { $inc: { balance: plan.starterShare }, $set: { referralRewardAppliedAt: appliedAt }, $push: { activities: { type: "referral_starter_bonus", title: "Referral starter balance", amount: plan.starterShare, points: 0, createdAt: appliedAt } } }, { session });
+          await users.updateOne({ _id: req.user.invitedByUserId }, { $inc: { balance: plan.inviterShare, referralEarnings: plan.inviterShare }, $push: { activities: { type: "referral_bonus", title: `Referral reward from ${req.user.accountId}`, amount: plan.inviterShare, points: 0, createdAt: appliedAt } } }, { session });
+          await transactions.insertMany([
+            { userId: req.user._id, accountId: req.user.accountId, type: "referral_starter_bonus", status: "completed", amount: plan.starterShare, paymentMethod: "Referral", description: `40% starter balance from Worker ${workerLevel} referral bonus`, createdAt: appliedAt },
+            { userId: req.user.invitedByUserId, type: "referral_bonus", status: "completed", amount: plan.inviterShare, paymentMethod: "Referral", description: `60% referral reward from account ${req.user.accountId}`, createdAt: appliedAt }
+          ], { session });
+          referralApplied = true;
+        } catch (error) {
+          if (error?.code !== 11000) throw error;
+        }
+      }
+    });
+  } catch (error) {
+    return res.status(error.status || 400).json({ message: error.message || "Could not complete worker application." });
+  } finally { await session.endSession(); }
+  const updated = await users.findOne({ _id: req.user._id });
+  return res.json({ message: `Application accepted for ${plan.membershipLevel}. Tasks are now unlocked.${referralApplied ? ` ₱${plan.starterShare.toFixed(2)} referral starter balance added.` : ""}`, user: publicUser(updated), transaction: { type: "worker_application", status: "completed", amount: -plan.cost } });
+});
+
+app.post("/api/wallet/topup", requireAuth, async (req, res) => {
+  const amount = Number(req.body?.amount);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) return res.status(400).json({ message: "Enter a valid top-up amount." });
+  const activity = { type: "topup", title: "Wallet top-up", amount, points: 0, createdAt: new Date() };
+  await users.updateOne({ _id: req.user._id }, { $inc: { balance: amount }, $push: { activities: activity } });
+  await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "topup", status: "completed", amount, paymentMethod: "QRPh", description: "Wallet top-up (local test payment)", createdAt: new Date() });
+  const updated = await users.findOne({ _id: req.user._id });
+  return res.json({ message: "Top-up successful.", user: publicUser(updated) });
+});
+
+app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
+  const amount = Number(req.body?.amount);
+  const withdrawalPassword = String(req.body?.withdrawalPassword || "");
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ message: "Enter a valid withdrawal amount." });
+  if (!req.user.withdrawalBank?.accountNumber) return res.status(400).json({ message: "Add one personal bank account before withdrawing." });
+  if (!req.user.withdrawalPasswordHash) return res.status(400).json({ message: "Set your withdrawal password first." });
+  if (!(await bcrypt.compare(withdrawalPassword, req.user.withdrawalPasswordHash))) return res.status(401).json({ message: "Incorrect withdrawal password." });
+  const weekly = await withdrawalStatus(req.user);
+  if (weekly.limit <= 0) return res.status(403).json({ message: "Purchase a membership before withdrawing." });
+  if (amount > weekly.remaining) return res.status(400).json({ message: `Weekly withdrawal limit exceeded. Remaining this week: ₱${weekly.remaining.toFixed(2)}.` });
+  const result = await users.findOneAndUpdate(
+    { _id: req.user._id, balance: { $gte: amount } },
+    { $inc: { balance: -amount }, $push: { activities: { type: "withdraw", title: "Bank withdrawal request", amount: -amount, points: 0, status: "pending", createdAt: new Date() } } },
+    { returnDocument: "after" }
+  );
+  if (!result) return res.status(400).json({ message: "Insufficient balance." });
+  await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), createdAt: new Date() });
+  return res.json({ message: "Withdrawal request submitted and saved as pending.", user: publicUser(result) });
+});
+
+app.post("/api/activities/complete", requireAuth, async (req, res) => {
+  const allowed = { daily_checkin: ["Daily check-in", 5], task_center: ["Task completed", 20], share: ["Share & Earn", 10] };
+  const reward = allowed[String(req.body?.activity)];
+  if (!reward) return res.status(400).json({ message: "Unknown activity." });
+  const [title, points] = reward;
+  const activity = { type: "reward", title, points, amount: 0, createdAt: new Date() };
+  await users.updateOne({ _id: req.user._id }, { $inc: { points }, $push: { activities: activity } });
+  const updated = await users.findOne({ _id: req.user._id });
+  return res.json({ message: `You earned ${points} points.`, user: publicUser(updated) });
+});
+
+async function start() {
+  mongoClient = new MongoClient(mongoUri);
+  await mongoClient.connect();
+  const db = mongoClient.db(dbName);
+  users = db.collection("users");
+  transactions = db.collection("transactions");
+  captchaTasks = db.collection("captcha_tasks");
+  captchaUsage = db.collection("captcha_usage");
+  notifications = db.collection("notifications");
+  referralRewards = db.collection("referral_rewards");
+  partnershipRewards = db.collection("partnership_rewards");
+  supportMessages = db.collection("support_messages");
+  commissionOrders = db.collection("demo_investments");
+  commissionStocks = db.collection("commission_stocks");
+  surveyQuestions = db.collection("survey_questions");
+  surveyAnswers = db.collection("survey_answers");
+  await users.createIndex({ phone: 1 }, { unique: true });
+  await users.createIndex({ accountId: 1 }, { unique: true, sparse: true });
+  await transactions.createIndex({ userId: 1, createdAt: -1 });
+  await captchaTasks.createIndex({ status: 1, createdAt: 1 });
+  await captchaTasks.createIndex({ generationKey: 1 }, { unique: true, sparse: true });
+  await captchaTasks.createIndex({ assignedTo: 1, status: 1 });
+  await captchaTasks.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 86400 });
+  await captchaUsage.createIndex({ userId: 1, dayKey: 1 }, { unique: true });
+  await notifications.createIndex({ userId: 1, createdAt: -1 });
+  await referralRewards.createIndex({ rewardId: 1 }, { unique: true });
+  await referralRewards.createIndex({ inviterUserId: 1, createdAt: -1 });
+  await partnershipRewards.createIndex({ rewardId: 1 }, { unique: true });
+  await partnershipRewards.createIndex({ recipientUserId: 1, createdAt: -1 });
+  await supportMessages.createIndex({ userId: 1, createdAt: 1 });
+  await commissionOrders.createIndex({ userId: 1, createdAt: -1 });
+  await commissionOrders.createIndex({ userId: 1, companyId: 1, stockDeploymentId: 1 });
+  await commissionStocks.createIndex({ companyId: 1 }, { unique: true });
+  await commissionStocks.createIndex({ active: 1, deadlineAt: 1 });
+  await surveyQuestions.createIndex({ questionKey: 1 }, { unique: true });
+  await surveyQuestions.createIndex({ active: 1, sortOrder: 1 });
+  await surveyAnswers.createIndex({ userId: 1, questionId: 1 }, { unique: true });
+  await surveyAnswers.createIndex({ userId: 1, dayKey: 1, answeredAt: -1 });
+  const surveyBank = buildSurveyQuestionBank();
+  if (surveyBank.length !== 500) throw new Error(`Expected 500 survey questions, generated ${surveyBank.length}.`);
+  await surveyQuestions.bulkWrite(surveyBank.map(question => ({ updateOne: { filter: { questionKey: question.questionKey }, update: { $set: question }, upsert: true } })), { ordered: false });
+  const existingAdmin = await users.findOne({ phone: adminPhone });
+  const adminPasswordHash = await bcrypt.hash(adminPassword, 12);
+  if (existingAdmin) {
+    await users.updateOne({ _id: existingAdmin._id }, { $set: { fullName: "ClickWorker Administrator", passwordHash: adminPasswordHash, role: "Admin", restricted: false, banned: false, updatedAt: new Date() } });
+  } else {
+    const createdAt = new Date();
+    await users.insertOne({
+      accountId: "ADMIN01", inviteCode: "CWADMIN01", phone: adminPhone, fullName: "ClickWorker Administrator",
+      passwordHash: adminPasswordHash, points: 0, balance: 0, membershipLevel: "Administrator", activeWorker: 0,
+      role: "Admin", restricted: false, banned: false, guidanceAcceptedAt: createdAt,
+      activities: [{ type: "account", title: "Administrator account created", points: 0, amount: 0, createdAt }], createdAt
+    });
+  }
+  app.listen(port, "0.0.0.0", () => console.log(`ClickWorker auth API listening on port ${port}`));
+}
+
+start().catch((error) => {
+  console.error("MongoDB connection failed", error);
+  process.exit(1);
+});
+
+

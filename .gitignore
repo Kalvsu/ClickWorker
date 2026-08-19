@@ -1,0 +1,12 @@
+# Dependencies and local runtime files
+node_modules/
+.env
+output/
+*.log
+server-runtime.*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
