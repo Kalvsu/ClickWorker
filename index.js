@@ -178,6 +178,12 @@ let surveyQuestions;
 let surveyAnswers;
 let workerAgreements;
 let paymentOrders;
+let gameConfigs;
+let gameTeams;
+let gameInvites;
+let gameScores;
+let gameXpEvents;
+let gameRewards;
 let mongoClient;
 
 const MAX_PROFILE_IMAGE_BYTES = 3 * 1024 * 1024;
@@ -188,6 +194,62 @@ const WITHDRAWAL_SUGGESTED_AMOUNTS = [150, 600, 1500, 4000, 10000, 30000, 100000
 
 const adminPhone = normalizePhone(process.env.ADMIN_PHONE || "9990000000");
 const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe-Admin-2026!";
+
+const DEFAULT_GAME_RANK_REWARDS = [40, 25, 15, 8, 5, 3, 2, 1, 0.5, 0.5];
+function gameXpForWorker(level) { return Math.max(0, Math.round(Number(level || 0) * 10)); }
+function publicGameConfig(game, admin = false) {
+  if (!game) return null;
+  const value = { id: String(game.deploymentId || ""), title: game.title || "Weekly Team Challenge", description: game.description || "Complete regular ClickWorker jobs with your team and climb the XP leaderboard.", rules: game.rules || "Create or join one team. Complete eligible jobs during the event. XP is awarded once per completed job.", criteria: game.criteria || "Worker level determines XP: level 1 earns 10 XP, level 2 earns 20 XP, up to level 9 earning 90 XP per eligible job.", active: game.status === "active", status: game.status || "draft", startAt: game.startAt || null, endAt: game.endAt || null, prizePool: Number(game.prizePool || 0), rankRewards: Array.isArray(game.rankRewards) ? game.rankRewards.map(Number) : DEFAULT_GAME_RANK_REWARDS, maxTeamSize: Number(game.maxTeamSize || 10) };
+  if (admin) value.updatedAt = game.updatedAt || null;
+  return value;
+}
+async function currentGameConfig(includeDraft = false) {
+  const game = await gameConfigs.findOne({ key: "weekly" });
+  if (!game) return null;
+  if (!includeDraft && game.status !== "active" && game.status !== "completed") return null;
+  return game;
+}
+async function awardWeeklyGameXp(user, sourceId, sourceTitle, session) {
+  const now = new Date();
+  const game = await gameConfigs.findOne({ key: "weekly", status: "active", startAt: { $lte: now }, endAt: { $gt: now } }, { session });
+  if (!game?.deploymentId) return 0;
+  const team = await gameTeams.findOne({ memberIds: user._id }, { session });
+  if (!team) return 0;
+  const xp = gameXpForWorker(user.activeWorker);
+  if (!xp) return 0;
+  try {
+    await gameXpEvents.insertOne({ deploymentId: game.deploymentId, teamId: team._id, userId: user._id, accountId: user.accountId, sourceId: String(sourceId), sourceTitle: String(sourceTitle || "Completed job"), workerLevel: Number(user.activeWorker || 0), xp, createdAt: now }, { session });
+  } catch (error) { if (error?.code === 11000) return 0; throw error; }
+  await gameScores.updateOne({ deploymentId: game.deploymentId, teamId: team._id }, { $inc: { totalXp: xp }, $set: { teamName: team.name, updatedAt: now }, $setOnInsert: { createdAt: now } }, { upsert: true, session });
+  return xp;
+}
+async function settleWeeklyGame() {
+  const now = new Date();
+  const game = await gameConfigs.findOne({ key: "weekly", status: { $in: ["active", "settling"] }, endAt: { $lte: now } });
+  if (!game?.deploymentId) return;
+  await gameConfigs.updateOne({ _id: game._id, status: "active" }, { $set: { status: "settling", updatedAt: now } });
+  const scores = await gameScores.find({ deploymentId: game.deploymentId }).sort({ totalXp: -1, updatedAt: 1 }).limit(10).toArray();
+  const percentages = Array.isArray(game.rankRewards) ? game.rankRewards : DEFAULT_GAME_RANK_REWARDS;
+  for (let index = 0; index < scores.length; index += 1) {
+    const team = await gameTeams.findOne({ _id: scores[index].teamId });
+    const members = team?.memberIds || [];
+    const teamReward = Number((Number(game.prizePool || 0) * Number(percentages[index] || 0) / 100).toFixed(2));
+    if (!members.length || teamReward <= 0) continue;
+    const perMember = Number((teamReward / members.length).toFixed(2));
+    for (const userId of members) {
+      const rewardId = `${game.deploymentId}:${team._id}:${userId}`;
+      const session = mongoClient.startSession();
+      try {
+        await session.withTransaction(async () => {
+          try { await gameRewards.insertOne({ rewardId, deploymentId: game.deploymentId, teamId: team._id, teamName: team.name, userId, rank: index + 1, teamXp: Number(scores[index].totalXp || 0), teamReward, points: perMember, createdAt: now }, { session }); }
+          catch (error) { if (error?.code === 11000) return; throw error; }
+          await users.updateOne({ _id: userId }, { $inc: { points: perMember, gameEarnings: perMember }, $push: { activities: { type: "game_reward", title: `${game.title || "Weekly Team Challenge"} · Rank ${index + 1}`, points: perMember, amount: 0, createdAt: now } } }, { session });
+        });
+      } finally { await session.endSession(); }
+    }
+  }
+  await gameConfigs.updateOne({ _id: game._id, status: "settling" }, { $set: { status: "completed", settledAt: new Date(), updatedAt: new Date() } });
+}
 
 // Commission-earn products shown by the capstone application.
 const commissionEarnCompanies = [
@@ -1221,6 +1283,7 @@ app.post("/api/tasks/captcha/:id/submit", requireAuth, async (req, res) => {
         if (rewardPoints > 0) {
           await users.updateOne({ _id: req.user._id }, { $inc: { points: rewardPoints }, $push: { activities: { type: "captcha_encoding", title: "Captcha Encoding", points: rewardPoints, amount: 0, answer: String(req.body?.answer || "").trim().toUpperCase(), taskId: id.toString(), correct: true, createdAt: new Date() } } }, { session });
           await awardPartnershipCommission(req.user, rewardPoints, id.toString(), "Captcha Encoding", session);
+          await awardWeeklyGameXp(req.user, id.toString(), "Captcha Encoding", session);
         }
       });
     } finally { await session.endSession(); }
@@ -1298,6 +1361,7 @@ app.post("/api/tasks/survey/:id/answer", requireAuth, async (req, res) => {
       }
       await users.updateOne({ _id: req.user._id }, { $inc: { points: rewardPoints }, $push: { activities: { type: "survey_task", title: question.prompt, points: rewardPoints, amount: 0, answer, taskId: questionId.toString(), createdAt: now } } }, { session });
       await awardPartnershipCommission(req.user, rewardPoints, questionId.toString(), question.prompt, session);
+      await awardWeeklyGameXp(req.user, questionId.toString(), question.prompt, session);
       accepted = true;
     });
     if (!accepted) return res.status(409).json({ message: "Survey answer was not recorded." });
@@ -1502,6 +1566,80 @@ app.post("/api/activities/complete", requireAuth, async (req, res) => {
   return res.json({ message: `You earned ${points} points.`, user: publicUser(updated) });
 });
 
+async function gameMemberView(user) {
+  await settleWeeklyGame();
+  const game = await currentGameConfig();
+  const team = await gameTeams.findOne({ memberIds: user._id });
+  const invites = await gameInvites.find({ inviteeId: user._id, status: "pending" }).sort({ createdAt: -1 }).toArray();
+  const leaderboard = game?.deploymentId ? await gameScores.find({ deploymentId: game.deploymentId }).sort({ totalXp: -1, updatedAt: 1 }).limit(10).toArray() : [];
+  const score = game?.deploymentId && team ? await gameScores.findOne({ deploymentId: game.deploymentId, teamId: team._id }) : null;
+  const earningsRows = await gameRewards.find({ userId: user._id }).sort({ createdAt: -1 }).limit(100).toArray();
+  return {
+    game: publicGameConfig(game),
+    team: team ? { id: team._id.toString(), name: team.name, ownerAccountId: team.ownerAccountId, isOwner: String(team.ownerId) === String(user._id), members: await Promise.all(team.memberIds.map(async id => { const member = await users.findOne({ _id: id }, { projection: { fullName: 1, accountId: 1, activeWorker: 1 } }); return member ? { accountId: member.accountId, fullName: member.fullName, workerLevel: Number(member.activeWorker || 0), xpPerJob: gameXpForWorker(member.activeWorker) } : null; })).then(items => items.filter(Boolean)), totalXp: Number(score?.totalXp || 0) } : null,
+    invites: invites.map(item => ({ id: item._id.toString(), teamName: item.teamName, inviterAccountId: item.inviterAccountId, createdAt: item.createdAt })),
+    leaderboard: leaderboard.map((item, index) => ({ rank: index + 1, teamName: item.teamName, totalXp: Number(item.totalXp || 0), percentage: Number(game?.rankRewards?.[index] || 0), reward: Number((Number(game?.prizePool || 0) * Number(game?.rankRewards?.[index] || 0) / 100).toFixed(2)) })),
+    gameEarnings: Number(earningsRows.reduce((sum, item) => sum + Number(item.points || 0), 0).toFixed(2)),
+    earnings: earningsRows.map(item => ({ id: item._id.toString(), title: item.teamName, rank: item.rank, points: item.points, createdAt: item.createdAt })),
+  };
+}
+
+app.get("/api/games/weekly", requireAuth, async (req, res) => res.json(await gameMemberView(req.user)));
+app.post("/api/games/teams", requireAuth, async (req, res) => {
+  if (await gameTeams.findOne({ memberIds: req.user._id })) return res.status(409).json({ message: "You can create or join only one team." });
+  const name = String(req.body?.name || "").trim().replace(/\s+/g, " ");
+  if (name.length < 3 || name.length > 40) return res.status(400).json({ message: "Team name must contain 3 to 40 characters." });
+  try { await gameTeams.insertOne({ name, nameKey: name.toLowerCase(), ownerId: req.user._id, ownerAccountId: req.user.accountId, memberIds: [req.user._id], createdAt: new Date(), updatedAt: new Date() }); }
+  catch (error) { if (error?.code === 11000) return res.status(409).json({ message: "That team name is already used." }); throw error; }
+  return res.status(201).json({ message: "Team created.", ...(await gameMemberView(req.user)) });
+});
+app.post("/api/games/teams/invite", requireAuth, async (req, res) => {
+  const team = await gameTeams.findOne({ ownerId: req.user._id });
+  if (!team) return res.status(403).json({ message: "Only the team creator can invite members." });
+  const game = await currentGameConfig(true); const maxTeamSize = Number(game?.maxTeamSize || 10);
+  if (team.memberIds.length >= maxTeamSize) return res.status(400).json({ message: "Team is already full." });
+  const uid = String(req.body?.uid || "").trim(); const invitee = await users.findOne({ accountId: uid, role: { $ne: "Admin" } });
+  if (!invitee) return res.status(404).json({ message: "UID was not found." });
+  if (String(invitee._id) === String(req.user._id)) return res.status(400).json({ message: "You are already on this team." });
+  if (await gameTeams.findOne({ memberIds: invitee._id })) return res.status(409).json({ message: "That member already belongs to a team." });
+  try { await gameInvites.insertOne({ teamId: team._id, teamName: team.name, inviterId: req.user._id, inviterAccountId: req.user.accountId, inviteeId: invitee._id, inviteeAccountId: invitee.accountId, status: "pending", createdAt: new Date() }); }
+  catch (error) { if (error?.code === 11000) return res.status(409).json({ message: "Invitation already sent." }); throw error; }
+  return res.status(201).json({ message: `Invitation sent to ${invitee.accountId}.` });
+});
+app.post("/api/games/invitations/:id/respond", requireAuth, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid invitation." }); }
+  const decision = String(req.body?.decision || "").toLowerCase();
+  if (!['accept', 'decline'].includes(decision)) return res.status(400).json({ message: "Choose accept or decline." });
+  const invite = await gameInvites.findOne({ _id: id, inviteeId: req.user._id, status: "pending" });
+  if (!invite) return res.status(404).json({ message: "Invitation is no longer available." });
+  if (decision === 'decline') { await gameInvites.updateOne({ _id: id, status: "pending" }, { $set: { status: "declined", respondedAt: new Date() } }); return res.json({ message: "Invitation declined.", ...(await gameMemberView(req.user)) }); }
+  if (await gameTeams.findOne({ memberIds: req.user._id })) return res.status(409).json({ message: "You already belong to a team." });
+  const game = await currentGameConfig(true); const maxTeamSize = Number(game?.maxTeamSize || 10);
+  const joined = await gameTeams.findOneAndUpdate({ _id: invite.teamId, memberIds: { $ne: req.user._id }, $expr: { $lt: [{ $size: "$memberIds" }, maxTeamSize] } }, { $push: { memberIds: req.user._id }, $set: { updatedAt: new Date() } }, { returnDocument: "after" });
+  if (!joined) return res.status(409).json({ message: "Team is no longer available or is full." });
+  await gameInvites.updateMany({ inviteeId: req.user._id, status: "pending" }, { $set: { status: "closed", respondedAt: new Date() } });
+  return res.json({ message: `You joined ${joined.name}.`, ...(await gameMemberView(req.user)) });
+});
+app.get("/api/games/earnings", requireAuth, async (req, res) => { const view = await gameMemberView(req.user); return res.json({ total: view.gameEarnings, earnings: view.earnings }); });
+
+app.get("/api/admin/games/weekly", requireAuth, requireAdmin, async (_req, res) => res.json({ game: publicGameConfig(await currentGameConfig(true), true) }));
+app.put("/api/admin/games/weekly", requireAuth, requireAdmin, async (req, res) => {
+  const title = String(req.body?.title || "Weekly Team Challenge").trim().slice(0, 80);
+  const description = String(req.body?.description || "").trim().slice(0, 1000);
+  const rules = String(req.body?.rules || "").trim().slice(0, 3000);
+  const criteria = String(req.body?.criteria || "").trim().slice(0, 3000);
+  const prizePool = Number(req.body?.prizePool); const maxTeamSize = Math.round(Number(req.body?.maxTeamSize));
+  const startAt = new Date(req.body?.startAt); const endAt = new Date(req.body?.endAt);
+  const rankRewards = Array.isArray(req.body?.rankRewards) ? req.body.rankRewards.slice(0, 10).map(Number) : [];
+  if (!title || !description || !rules || !criteria) return res.status(400).json({ message: "Complete game title, description, rules, and criteria." });
+  if (!Number.isFinite(prizePool) || prizePool < 0 || !Number.isInteger(maxTeamSize) || maxTeamSize < 2 || maxTeamSize > 100) return res.status(400).json({ message: "Enter a valid prize pool and team size from 2 to 100." });
+  if (Number.isNaN(startAt.getTime()) || Number.isNaN(endAt.getTime()) || endAt <= startAt) return res.status(400).json({ message: "End time must be after start time." });
+  if (rankRewards.length !== 10 || rankRewards.some(value => !Number.isFinite(value) || value < 0 || value > 100) || rankRewards.reduce((sum, value) => sum + value, 0) > 100.0001) return res.status(400).json({ message: "Provide 10 valid rank percentages totaling no more than 100%." });
+  const active = Boolean(req.body?.active); const deploymentId = active ? `weekly-${Date.now()}` : String((await currentGameConfig(true))?.deploymentId || "");
+  await gameConfigs.updateOne({ key: "weekly" }, { $set: { key: "weekly", deploymentId, title, description, rules, criteria, prizePool: Number(prizePool.toFixed(2)), maxTeamSize, startAt, endAt, rankRewards, status: active ? "active" : "draft", updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+  return res.json({ message: active ? "Weekly game deployed." : "Weekly game saved as draft.", game: publicGameConfig(await currentGameConfig(true), true) });
+});
+
 async function start() {
   mongoClient = new MongoClient(mongoUri);
   await mongoClient.connect();
@@ -1520,6 +1658,12 @@ async function start() {
   surveyAnswers = db.collection("survey_answers");
   workerAgreements = db.collection("worker_agreements");
   paymentOrders = db.collection("payment_orders");
+  gameConfigs = db.collection("game_configs");
+  gameTeams = db.collection("game_teams");
+  gameInvites = db.collection("game_invites");
+  gameScores = db.collection("game_scores");
+  gameXpEvents = db.collection("game_xp_events");
+  gameRewards = db.collection("game_rewards");
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ accountId: 1 }, { unique: true, sparse: true });
   await transactions.createIndex({ userId: 1, createdAt: -1 });
@@ -1547,6 +1691,16 @@ async function start() {
   await paymentOrders.createIndex({ userId: 1, createdAt: -1 });
   await paymentOrders.createIndex({ userId: 1, status: 1, createdAt: -1 });
   await paymentOrders.createIndex({ checkoutSessionId: 1 }, { unique: true, sparse: true });
+  await gameConfigs.createIndex({ key: 1 }, { unique: true });
+  await gameTeams.createIndex({ nameKey: 1 }, { unique: true });
+  await gameTeams.createIndex({ memberIds: 1 });
+  await gameInvites.createIndex({ teamId: 1, inviteeId: 1, status: 1 }, { unique: true, partialFilterExpression: { status: "pending" } });
+  await gameInvites.createIndex({ inviteeId: 1, status: 1, createdAt: -1 });
+  await gameScores.createIndex({ deploymentId: 1, teamId: 1 }, { unique: true });
+  await gameScores.createIndex({ deploymentId: 1, totalXp: -1 });
+  await gameXpEvents.createIndex({ deploymentId: 1, userId: 1, sourceId: 1 }, { unique: true });
+  await gameRewards.createIndex({ rewardId: 1 }, { unique: true });
+  await gameRewards.createIndex({ userId: 1, createdAt: -1 });
   await transactions.createIndex({ userId: 1, type: 1, scheduleKey: 1 }, { unique: true, partialFilterExpression: { type: 'withdrawal', scheduleKey: { $type: 'string' } } });
   const surveyBank = buildSurveyQuestionBank();
   if (surveyBank.length !== 500) throw new Error(`Expected 500 survey questions, generated ${surveyBank.length}.`);
