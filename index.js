@@ -90,7 +90,10 @@ function verifyPaymongoCheckout(order, session) {
   const attributes = session?.attributes || {};
   const expectedLiveMode = paymongoSecretKey.startsWith("sk_live_");
   const currency = String(attributes.currency || attributes.line_items?.[0]?.currency || PAYMONGO_CURRENCY).toUpperCase();
-  return Boolean(session?.id && String(session.id) === String(order.checkoutSessionId || "") && String(attributes.client_reference_number || "") === String(order._id) && checkoutAmountCentavos(attributes) === Number(order.amountCentavos) && currency === PAYMONGO_CURRENCY && (typeof session.livemode !== "boolean" || session.livemode === expectedLiveMode));
+  const orderReference = String(order.referenceNumber || "");
+  const providerOrderId = String(attributes.client_reference_number || attributes.metadata?.order_id || "");
+  const orderMatches = providerOrderId ? providerOrderId === String(order._id) : Boolean(orderReference && String(attributes.reference_number || "") === orderReference);
+  return Boolean(session?.id && String(session.id) === String(order.checkoutSessionId || "") && orderMatches && checkoutAmountCentavos(attributes) === Number(order.amountCentavos) && currency === PAYMONGO_CURRENCY && (typeof session.livemode !== "boolean" || session.livemode === expectedLiveMode) && (typeof attributes.livemode !== "boolean" || attributes.livemode === expectedLiveMode));
 }
 
 async function creditPaidPaymongoOrder(orderId, checkoutSessionId, paymentId, paidAt) {
@@ -1412,7 +1415,7 @@ app.post("/api/wallet/paymongo/checkout", requireAuth, async (req, res) => {
   const created = await paymentOrders.insertOne(order); order._id = created.insertedId;
   const referenceNumber = `CW-${req.user.accountId}-${created.insertedId.toString()}`;
   try {
-    const checkout = await paymongoRequest("/v1/checkout_sessions", "POST", { data: { attributes: { billing: { name: req.user.fullName || "ClickWorker Member", phone: req.user.phone || undefined }, cancel_url: `${origin}/?payment=cancelled&order=${created.insertedId}`, success_url: `${origin}/?payment=return&order=${created.insertedId}`, client_reference_number: created.insertedId.toString(), reference_number: referenceNumber, description: "ClickWorker Cash Wallet top-up", line_items: [{ amount: order.amountCentavos, currency: PAYMONGO_CURRENCY, name: "ClickWorker Cash Wallet", quantity: 1 }], payment_method_types: ["gcash", "qrph"], send_email_receipt: false, show_description: true, show_line_items: true } } });
+    const checkout = await paymongoRequest("/v1/checkout_sessions", "POST", { data: { attributes: { billing: { name: req.user.fullName || "ClickWorker Member", phone: req.user.phone || undefined }, cancel_url: `${origin}/?payment=cancelled&order=${created.insertedId}`, success_url: `${origin}/?payment=return&order=${created.insertedId}`, client_reference_number: created.insertedId.toString(), reference_number: referenceNumber, metadata: { order_id: created.insertedId.toString() }, description: "ClickWorker Cash Wallet top-up", line_items: [{ amount: order.amountCentavos, currency: PAYMONGO_CURRENCY, name: "ClickWorker Cash Wallet", quantity: 1 }], payment_method_types: ["gcash", "qrph"], send_email_receipt: false, show_description: true, show_line_items: true } } });
     const attributes = checkout?.data?.attributes || {};
     const checkoutUrl = attributes.checkout_url;
     if (!checkoutUrl) throw new Error("PayMongo did not return a checkout URL.");
