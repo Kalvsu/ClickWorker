@@ -59,26 +59,40 @@ function clearAuthCookie(res) {
   res.setHeader("Set-Cookie", attributes.join("; "));
 }
 
-const rateLimitBuckets = new Map();
 function rateLimit({ windowMs, max, key = req => req.ip, message = "Too many requests. Please try again later." }) {
-  return (req, res, next) => {
-    const now = Date.now();
-    const bucketKey = `${req.path}:${key(req)}`;
-    let bucket = rateLimitBuckets.get(bucketKey);
-    if (!bucket || bucket.resetAt <= now) bucket = { count: 0, resetAt: now + windowMs };
-    bucket.count += 1;
-    rateLimitBuckets.set(bucketKey, bucket);
-    res.set("RateLimit-Limit", String(max));
-    res.set("RateLimit-Remaining", String(Math.max(0, max - bucket.count)));
-    res.set("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
-    if (bucket.count > max) {
-      res.set("Retry-After", String(Math.ceil((bucket.resetAt - now) / 1000)));
-      return res.status(429).json({ message });
+  return async (req, res, next) => {
+    try {
+      if (!rateLimits) return res.status(503).json({ message: "Request protection is temporarily unavailable." });
+      const now = new Date();
+      const bucketKey = crypto.createHash("sha256").update(`${req.method}:${req.path}:${key(req)}`).digest("hex");
+      const resetAt = new Date(now.getTime() + windowMs);
+      const bucket = await rateLimits.findOneAndUpdate(
+        { _id: bucketKey },
+        [
+          { $set: {
+            count: { $cond: [{ $or: [{ $eq: [{ $type: "$resetAt" }, "missing"] }, { $lte: ["$resetAt", now] }] }, 1, { $add: [{ $ifNull: ["$count", 0] }, 1] }] },
+            resetAt: { $cond: [{ $or: [{ $eq: [{ $type: "$resetAt" }, "missing"] }, { $lte: ["$resetAt", now] }] }, resetAt, "$resetAt"] },
+            updatedAt: now
+          } }
+        ],
+        { upsert: true, returnDocument: "after" }
+      );
+      const count = Number(bucket?.count || 1);
+      const bucketResetAt = new Date(bucket?.resetAt || resetAt);
+      res.set("RateLimit-Limit", String(max));
+      res.set("RateLimit-Remaining", String(Math.max(0, max - count)));
+      res.set("RateLimit-Reset", String(Math.ceil(bucketResetAt.getTime() / 1000)));
+      if (count > max) {
+        res.set("Retry-After", String(Math.max(1, Math.ceil((bucketResetAt.getTime() - now.getTime()) / 1000))));
+        return res.status(429).json({ message });
+      }
+      next();
+    } catch (error) {
+      console.error("shared rate limiter", error);
+      return res.status(503).json({ message: "Request protection is temporarily unavailable." });
     }
-    next();
   };
 }
-setInterval(() => { const now = Date.now(); for (const [key, value] of rateLimitBuckets) if (value.resetAt <= now) rateLimitBuckets.delete(key); }, 10 * 60 * 1000).unref();
 
 function paymongoAuthHeader() { return `Basic ${Buffer.from(`${paymongoSecretKey}:`).toString("base64")}`; }
 
@@ -266,6 +280,7 @@ let gameInvites;
 let gameScores;
 let gameXpEvents;
 let gameRewards;
+let rateLimits;
 let mongoClient;
 
 const MAX_PROFILE_IMAGE_BYTES = 3 * 1024 * 1024;
@@ -1813,6 +1828,7 @@ async function start() {
   gameScores = db.collection("game_scores");
   gameXpEvents = db.collection("game_xp_events");
   gameRewards = db.collection("game_rewards");
+  rateLimits = db.collection("rate_limits");
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ accountId: 1 }, { unique: true, sparse: true });
   await transactions.createIndex({ userId: 1, createdAt: -1 });
@@ -1850,6 +1866,7 @@ async function start() {
   await gameXpEvents.createIndex({ deploymentId: 1, userId: 1, sourceId: 1 }, { unique: true });
   await gameRewards.createIndex({ rewardId: 1 }, { unique: true });
   await gameRewards.createIndex({ userId: 1, createdAt: -1 });
+  await rateLimits.createIndex({ resetAt: 1 }, { expireAfterSeconds: 0 });
   await transactions.createIndex({ userId: 1, type: 1, scheduleKey: 1 }, { unique: true, partialFilterExpression: { type: 'withdrawal', scheduleKey: { $type: 'string' } } });
   const surveyBank = buildSurveyQuestionBank();
   if (surveyBank.length !== 500) throw new Error(`Expected 500 survey questions, generated ${surveyBank.length}.`);
