@@ -150,8 +150,6 @@ app.use(express.static(require("path").join(__dirname, "public")));
 // opens the registration form with it already filled in.
 app.get("/referral", (_req, res) => res.sendFile(require("path").join(__dirname, "public", "index.html")));
 app.get("/refferal", (_req, res) => res.sendFile(require("path").join(__dirname, "public", "index.html")));
-app.get("/favicon.ico", (_req, res) => res.status(204).end());
-
 let users;
 let transactions;
 let captchaTasks;
