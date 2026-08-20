@@ -47,6 +47,17 @@ function validPaymongoSignature(req) {
   const hash = crypto.createHmac("sha256", paymongoWebhookSecret).update(`${timestamp}.${req.rawBody}`).digest("hex");
   try { return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(expected, "hex")); } catch (_) { return false; }
 }
+function paymongoWebhookEvent(body) {
+  const envelope = body?.data || {};
+  // PayMongo v1 wraps event details in data.attributes. Newer webhook payloads
+  // put the event type and resource directly under data.
+  const attributes = envelope.attributes || {};
+  return {
+    type: String(attributes.type || envelope.type || ""),
+    livemode: typeof attributes.livemode === "boolean" ? attributes.livemode : Boolean(envelope.livemode),
+    resource: attributes.data || envelope.data || null,
+  };
+}
 function paymongoFailureReason(attributes, fallback) {
   const intent = attributes?.payment_intent?.attributes || attributes?.payment_intent || {};
   const error = intent.last_payment_error || attributes?.last_payment_error || {};
@@ -1438,19 +1449,18 @@ app.get("/api/wallet/paymongo/orders/:id", requireAuth, async (req, res) => {
 });
 app.post("/api/paymongo/webhook", async (req, res) => {
   if (!validPaymongoSignature(req)) return res.status(401).json({ message: "Invalid webhook signature." });
-  const payload = req.body?.data || {};
-  const eventType = String(payload.type || "");
-  if (eventType !== "checkout_session.payment.paid") return res.status(200).json({ received: true, ignored: true });
-  const session = payload.data || {};
+  const event = paymongoWebhookEvent(req.body);
+  if (event.type !== "checkout_session.payment.paid") return res.status(200).json({ received: true, ignored: true });
+  const session = event.resource || {};
   const details = session.attributes || {};
   const checkoutSessionId = String(session.id || "");
   const orderId = String(details.client_reference_number || "");
-  let objectId; try { objectId = new ObjectId(orderId); } catch (_) { return res.status(200).json({ received: true, ignored: true }); }
   try {
-    const order = await paymentOrders.findOne({ _id: objectId, provider: "paymongo" });
-    const eventLiveMode = Boolean(payload.livemode);
-    if (!order || !checkoutSessionId || eventLiveMode !== paymongoSecretKey.startsWith("sk_live_") || !verifyPaymongoCheckout(order, session)) return res.status(200).json({ received: true, ignored: true });
-    await creditPaidPaymongoOrder(objectId, checkoutSessionId, checkoutPaymentId(details), new Date());    return res.status(200).json({ received: true });
+    let objectId = null; try { objectId = new ObjectId(orderId); } catch (_) {}
+    const order = await paymentOrders.findOne({ provider: "paymongo", ...(objectId ? { _id: objectId, checkoutSessionId } : { checkoutSessionId }) });
+    if (!order || !checkoutSessionId || event.livemode !== paymongoSecretKey.startsWith("sk_live_") || !verifyPaymongoCheckout(order, session)) return res.status(200).json({ received: true, ignored: true });
+    await creditPaidPaymongoOrder(order._id, checkoutSessionId, checkoutPaymentId(details), new Date());
+    return res.status(200).json({ received: true });
   } catch (error) { console.error("paymongo webhook", error); return res.status(500).json({ message: "Webhook processing failed." }); }
 });
 app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
