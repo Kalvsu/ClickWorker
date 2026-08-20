@@ -20,4 +20,6 @@ The app is available at `http://localhost:3000` for local development. Productio
 
 Sensitive endpoints use the MongoDB `rate_limits` collection for shared rate limiting. Limits are therefore enforced across all Node.js workers and application instances connected to the same database; expired buckets are removed automatically by a TTL index.
 
+Registration requires SMS OTP verification through Twilio Verify. Configure `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_VERIFY_SERVICE_SID` in the server environment. These values are server-side secrets and must never be placed in frontend JavaScript. Twilio's free trial is suitable only for limited testing; production SMS delivery is usage-priced.
+
 > Do not commit `.env`; it contains local credentials.

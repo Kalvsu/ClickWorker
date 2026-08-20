@@ -16,6 +16,9 @@ const mongoUri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "clickworker";
 const paymongoSecretKey = process.env.PAYMONGO_SECRET_KEY || "";
 const paymongoWebhookSecret = process.env.PAYMONGO_WEBHOOK_SECRET || "";
+const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID || "";
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || "";
+const twilioVerifyServiceSid = process.env.TWILIO_VERIFY_SERVICE_SID || "";
 const appBaseUrl = String(process.env.APP_BASE_URL || "").replace(/\/$/, "");
 const isProduction = process.env.NODE_ENV === "production";
 const jwtIssuer = "clickworker-api";
@@ -47,16 +50,59 @@ function parseCookies(req) {
   }).filter(([name]) => name));
 }
 
+function appendSetCookie(res, value) {
+  const current = res.getHeader("Set-Cookie");
+  res.setHeader("Set-Cookie", current ? [...(Array.isArray(current) ? current : [current]), value] : value);
+}
+
 function setAuthCookie(res, token) {
   const attributes = [`cw_session=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=604800"];
   if (isProduction) attributes.push("Secure");
-  res.setHeader("Set-Cookie", attributes.join("; "));
+  appendSetCookie(res, attributes.join("; "));
 }
 
 function clearAuthCookie(res) {
   const attributes = ["cw_session=", "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
   if (isProduction) attributes.push("Secure");
-  res.setHeader("Set-Cookie", attributes.join("; "));
+  appendSetCookie(res, attributes.join("; "));
+}
+
+function signupSignal(value) {
+  return crypto.createHmac("sha256", process.env.JWT_SECRET).update(String(value || "unknown")).digest("hex");
+}
+
+function ensureSignupDevice(req, res) {
+  let deviceId = String(parseCookies(req).cw_device || "");
+  if (!/^[a-f0-9]{64}$/i.test(deviceId)) {
+    deviceId = crypto.randomBytes(32).toString("hex");
+    const attributes = [`cw_device=${deviceId}`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=31536000"];
+    if (isProduction) attributes.push("Secure");
+    appendSetCookie(res, attributes.join("; "));
+  }
+  return signupSignal(deviceId);
+}
+
+function otpConfigured() {
+  return /^AC[a-z0-9]{32}$/i.test(twilioAccountSid)
+    && /^VA[a-z0-9]{32}$/i.test(twilioVerifyServiceSid)
+    && twilioAuthToken.length >= 20
+    && !/^replace[-_ ]/i.test(twilioAuthToken);
+}
+
+async function twilioVerify(path, values) {
+  if (!otpConfigured()) { const error = new Error("SMS verification is not configured."); error.status = 503; throw error; }
+  const response = await fetch(`https://verify.twilio.com/v2/Services/${encodeURIComponent(twilioVerifyServiceSid)}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64")}`, "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: new URLSearchParams(values)
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(response.status === 429 ? "Too many verification attempts. Please wait and try again." : "Could not verify this phone number right now.");
+    error.status = response.status === 429 ? 429 : 502;
+    throw error;
+  }
+  return result;
 }
 
 function rateLimit({ windowMs, max, key = req => req.ip, message = "Too many requests. Please try again later." }) {
@@ -281,6 +327,7 @@ let gameScores;
 let gameXpEvents;
 let gameRewards;
 let rateLimits;
+let signupAttempts;
 let mongoClient;
 
 const MAX_PROFILE_IMAGE_BYTES = 3 * 1024 * 1024;
@@ -690,13 +737,35 @@ function requireAdminAccess(req, res, next) {
 app.get("/health", (_req, res) => res.json({ ok: Boolean(users) }));
 
 const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
+const otpSendRateLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, key: req => `${req.ip}:${normalizePhone(req.body?.phone)}` });
 const uploadRateLimit = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, key: req => String(req.user?._id || req.ip) });
 const simulatorRateLimit = rateLimit({ windowMs: 60 * 1000, max: 10 });
 const actionRateLimit = rateLimit({ windowMs: 60 * 1000, max: 60, key: req => String(req.user?._id || req.ip) });
+app.get("/api/auth/registration-config", (_req, res) => res.json({ otpRequired: true, otpConfigured: otpConfigured() }));
+
+app.post("/api/auth/register/send-otp", otpSendRateLimit, async (req, res) => {
+  try {
+    const normalizedPhone = normalizePhone(req.body?.phone);
+    if (!/^\+639\d{9}$/.test(normalizedPhone)) return res.status(400).json({ message: "Enter a valid Philippine mobile number." });
+    if (await users.findOne({ phone: normalizedPhone })) return res.status(409).json({ message: "An account already exists for this phone number." });
+    const deviceHash = ensureSignupDevice(req, res);
+    const ipHash = signupSignal(req.ip);
+    if (await users.findOne({ signupDeviceHash: deviceHash })) return res.status(409).json({ message: "This device already has a registered account. Contact support if this is a shared device." });
+    const recentNetworkSignups = await users.countDocuments({ signupIpHash: ipHash, role: { $ne: "Admin" }, createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
+    if (recentNetworkSignups >= 3) return res.status(429).json({ message: "Too many accounts were recently created from this network. Try later or contact support." });
+    const result = await twilioVerify("/Verifications", { To: normalizedPhone, Channel: "sms" });
+    if (result.status !== "pending") return res.status(502).json({ message: "Could not send the verification code." });
+    await signupAttempts.updateOne({ phone: normalizedPhone }, { $set: { phone: normalizedPhone, deviceHash, ipHash, status: "pending", updatedAt: new Date(), expiresAt: new Date(Date.now() + 15 * 60 * 1000) }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+    return res.json({ message: "Verification code sent by SMS.", expiresInSeconds: 600 });
+  } catch (error) {
+    return res.status(error.status || 502).json({ message: error.message || "Could not send the verification code." });
+  }
+});
+
 app.post("/api/auth/register", authRateLimit, async (req, res) => {
   try {
-    const { phone, fullName, referralCode, password } = req.body || {};
-    if (!phone || !fullName || !password) {
+    const { phone, fullName, referralCode, password, otp } = req.body || {};
+    if (!phone || !fullName || !password || !otp) {
       return res.status(400).json({ message: "All required fields must be completed." });
     }
     if (String(password).length < 10 || String(password).length > 128) {
@@ -709,6 +778,15 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
     if (normalizedName.length < 3 || normalizedName.length > 80 || /[\u0000-\u001f\u007f]/.test(normalizedName)) return res.status(400).json({ message: "Name must contain 3 to 80 valid characters." });
     const existing = await users.findOne({ phone: normalizedPhone });
     if (existing) return res.status(409).json({ message: "An account already exists for this phone number." });
+    const deviceHash = ensureSignupDevice(req, res);
+    const ipHash = signupSignal(req.ip);
+    if (await users.findOne({ signupDeviceHash: deviceHash })) return res.status(409).json({ message: "This device already has a registered account. Contact support if this is a shared device." });
+    const recentNetworkSignups = await users.countDocuments({ signupIpHash: ipHash, role: { $ne: "Admin" }, createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
+    if (recentNetworkSignups >= 3) return res.status(429).json({ message: "Too many accounts were recently created from this network. Try later or contact support." });
+    const pendingOtp = await signupAttempts.findOne({ phone: normalizedPhone, deviceHash, status: "pending", expiresAt: { $gt: new Date() } });
+    if (!pendingOtp) return res.status(400).json({ message: "Request a new SMS verification code first." });
+    const verification = await twilioVerify("/VerificationCheck", { To: normalizedPhone, Code: String(otp).replace(/\D/g, "").slice(0, 10) });
+    if (verification.status !== "approved") return res.status(400).json({ message: "The verification code is incorrect or expired." });
 
     const accountId = await generateAccountId();
     const submittedReferral = String(referralCode || "").trim().toUpperCase();
@@ -723,6 +801,9 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
       invitedByUserId: inviter?._id || null,
       invitedByAccountId: inviter?.accountId || "",
       passwordHash: await bcrypt.hash(String(password), 12),
+      phoneVerifiedAt: new Date(),
+      signupDeviceHash: deviceHash,
+      signupIpHash: ipHash,
       points: 0,
       balance: 15,
       signupBonusBalance: 15,
@@ -735,6 +816,7 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
     };
     const result = await users.insertOne(user);
     user._id = result.insertedId;
+    await signupAttempts.updateOne({ phone: normalizedPhone }, { $set: { status: "used", usedAt: new Date(), expiresAt: new Date() } });
     if (inviter) await users.updateOne({ _id: inviter._id }, { $inc: { referralCount: 1 } });
     await notifications.insertOne({
       userId: user._id,
@@ -1684,7 +1766,10 @@ app.post("/api/wallet/withdraw", requireAuth, rateLimit({ windowMs: 15 * 60 * 10
   const alreadyRequested = await transactions.findOne({ userId: req.user._id, type: "withdrawal", scheduleKey: schedule.periodKey });
   if (alreadyRequested) return res.status(409).json({ message: "You have already submitted a withdrawal request for this scheduled period." });
   const now = new Date();
-  const signupBonusUsed = Math.min(amount, Math.max(0, Number(req.user.signupBonusBalance || 0)));
+  const signupBonusBalance = Math.max(0, Number(req.user.signupBonusBalance || 0));
+  const nonBonusBalance = Math.max(0, Number(req.user.balance || 0) - signupBonusBalance);
+  const signupBonusUsed = Math.max(0, amount - nonBonusBalance);
+  if (signupBonusUsed > 0 && schedule.schedule?.day !== 5) return res.status(403).json({ message: "Signup bonus funds can only be withdrawn on Friday, 8:00 AM–6:00 PM Manila time." });
   const request = { userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumber: String(req.user.withdrawalBank.accountNumber), bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), scheduleKey: schedule.periodKey, scheduledDay: schedule.schedule.label, createdAt: now };
   const session = mongoClient.startSession();
   try {
@@ -1708,9 +1793,10 @@ async function gameMemberView(user) {
   const leaderboard = game?.deploymentId ? await gameScores.find({ deploymentId: game.deploymentId }).sort({ totalXp: -1, updatedAt: 1 }).limit(10).toArray() : [];
   const score = game?.deploymentId && team ? await gameScores.findOne({ deploymentId: game.deploymentId, teamId: team._id }) : null;
   const earningsRows = await gameRewards.find({ userId: user._id }).sort({ createdAt: -1 }).limit(100).toArray();
+  const teamMembers = team ? await Promise.all(team.memberIds.map(async id => { const member = await users.findOne({ _id: id }, { projection: { fullName: 1, accountId: 1, activeWorker: 1 } }); return member ? { accountId: member.accountId, fullName: member.fullName, workerLevel: Number(member.activeWorker || 0), xpPerJob: gameXpForWorker(member.activeWorker) } : null; })).then(items => items.filter(Boolean)) : [];
   return {
     game: publicGameConfig(game),
-    team: team ? { id: team._id.toString(), name: team.name, ownerAccountId: team.ownerAccountId, isOwner: String(team.ownerId) === String(user._id), members: await Promise.all(team.memberIds.map(async id => { const member = await users.findOne({ _id: id }, { projection: { fullName: 1, accountId: 1, activeWorker: 1 } }); return member ? { accountId: member.accountId, fullName: member.fullName, workerLevel: Number(member.activeWorker || 0), xpPerJob: gameXpForWorker(member.activeWorker) } : null; })).then(items => items.filter(Boolean)), totalXp: Number(score?.totalXp || 0) } : null,
+    team: team ? { id: team._id.toString(), name: team.name, ownerAccountId: team.ownerAccountId, isOwner: String(team.ownerId) === String(user._id), memberCount: teamMembers.length, members: teamMembers.slice(0, 10), totalXp: Number(score?.totalXp || 0) } : null,
     invites: invites.map(item => ({ id: item._id.toString(), teamName: item.teamName, inviterAccountId: item.inviterAccountId, createdAt: item.createdAt })),
     leaderboard: leaderboard.map((item, index) => ({ rank: index + 1, teamName: item.teamName, totalXp: Number(item.totalXp || 0), percentage: Number(game?.rankRewards?.[index] || 0), reward: Number((Number(game?.prizePool || 0) * Number(game?.rankRewards?.[index] || 0) / 100).toFixed(2)) })),
     gameEarnings: Number(earningsRows.reduce((sum, item) => sum + Number(item.points || 0), 0).toFixed(2)),
@@ -1728,6 +1814,15 @@ async function ensureGameInviteNotification(invite) {
 }
 
 app.get("/api/games/weekly", requireAuth, async (req, res) => res.json(await gameMemberView(req.user)));
+app.get("/api/games/teams/:id/members", requireAuth, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid team." }); }
+  const team = await gameTeams.findOne({ _id: id, memberIds: req.user._id });
+  if (!team) return res.status(404).json({ message: "Team not found." });
+  const query = String(req.query.q || "").trim().toLowerCase().slice(0, 80);
+  const members = await users.find({ _id: { $in: team.memberIds } }).project({ fullName: 1, accountId: 1, activeWorker: 1 }).toArray();
+  const rows = members.map(member => ({ accountId: member.accountId, fullName: member.fullName, workerLevel: Number(member.activeWorker || 0), xpPerJob: gameXpForWorker(member.activeWorker) })).filter(member => !query || member.fullName.toLowerCase().includes(query) || String(member.accountId).toLowerCase().includes(query)).sort((a, b) => a.fullName.localeCompare(b.fullName));
+  return res.json({ team: { id: team._id.toString(), name: team.name, memberCount: team.memberIds.length }, members: rows.slice(0, 100) });
+});
 app.post("/api/games/teams", requireAuth, async (req, res) => {
   if (await gameTeams.findOne({ memberIds: req.user._id })) return res.status(409).json({ message: "You can create or join only one team." });
   const name = String(req.body?.name || "").trim().replace(/\s+/g, " ");
@@ -1739,7 +1834,7 @@ app.post("/api/games/teams", requireAuth, async (req, res) => {
 app.post("/api/games/teams/invite", requireAuth, async (req, res) => {
   const team = await gameTeams.findOne({ ownerId: req.user._id });
   if (!team) return res.status(403).json({ message: "Only the team creator can invite members." });
-  const game = await currentGameConfig(true); const maxTeamSize = Number(game?.maxTeamSize || 10);
+  const game = await currentGameConfig(true); const maxTeamSize = Math.min(10, Number(game?.maxTeamSize || 10));
   if (team.memberIds.length >= maxTeamSize) return res.status(400).json({ message: "Team is already full." });
   const uid = String(req.body?.uid || "").trim(); const invitee = await users.findOne({ accountId: uid, role: { $ne: "Admin" } });
   if (!invitee) return res.status(404).json({ message: "UID was not found." });
@@ -1766,7 +1861,7 @@ app.post("/api/games/invitations/:id/respond", requireAuth, async (req, res) => 
   if (!invite) return res.status(404).json({ message: "Invitation is no longer available." });
   if (decision === 'decline') { await gameInvites.updateOne({ _id: id, status: "pending" }, { $set: { status: "declined", respondedAt: new Date() } }); return res.json({ message: "Invitation declined.", ...(await gameMemberView(req.user)) }); }
   if (await gameTeams.findOne({ memberIds: req.user._id })) return res.status(409).json({ message: "You already belong to a team." });
-  const game = await currentGameConfig(true); const maxTeamSize = Number(game?.maxTeamSize || 10);
+  const game = await currentGameConfig(true); const maxTeamSize = Math.min(10, Number(game?.maxTeamSize || 10));
   const joined = await gameTeams.findOneAndUpdate({ _id: invite.teamId, memberIds: { $ne: req.user._id }, $expr: { $lt: [{ $size: "$memberIds" }, maxTeamSize] } }, { $push: { memberIds: req.user._id }, $set: { updatedAt: new Date() } }, { returnDocument: "after" });
   if (!joined) return res.status(409).json({ message: "Team is no longer available or is full." });
   await gameInvites.updateMany({ inviteeId: req.user._id, status: "pending" }, { $set: { status: "closed", respondedAt: new Date() } });
@@ -1784,7 +1879,7 @@ app.put("/api/admin/games/weekly", requireAuth, requireAdmin, async (req, res) =
   const startAt = new Date(req.body?.startAt); const endAt = new Date(req.body?.endAt);
   const rankRewards = Array.isArray(req.body?.rankRewards) ? req.body.rankRewards.slice(0, 10).map(Number) : [];
   if (!title || !description || !rules || !criteria) return res.status(400).json({ message: "Complete game title, description, rules, and criteria." });
-  if (!Number.isFinite(prizePool) || prizePool < 0 || !Number.isInteger(maxTeamSize) || maxTeamSize < 2 || maxTeamSize > 100) return res.status(400).json({ message: "Enter a valid prize pool and team size from 2 to 100." });
+  if (!Number.isFinite(prizePool) || prizePool < 0 || !Number.isInteger(maxTeamSize) || maxTeamSize < 2 || maxTeamSize > 10) return res.status(400).json({ message: "Enter a valid prize pool and team size from 2 to 10." });
   if (Number.isNaN(startAt.getTime()) || Number.isNaN(endAt.getTime()) || endAt <= startAt) return res.status(400).json({ message: "End time must be after start time." });
   if (rankRewards.length !== 10 || rankRewards.some(value => !Number.isFinite(value) || value < 0 || value > 100) || rankRewards.reduce((sum, value) => sum + value, 0) > 100.0001) return res.status(400).json({ message: "Provide 10 valid rank percentages totaling no more than 100%." });
   const active = Boolean(req.body?.active); const deploymentId = active ? `weekly-${Date.now()}` : String((await currentGameConfig(true))?.deploymentId || "");
@@ -1829,8 +1924,11 @@ async function start() {
   gameXpEvents = db.collection("game_xp_events");
   gameRewards = db.collection("game_rewards");
   rateLimits = db.collection("rate_limits");
+  signupAttempts = db.collection("signup_attempts");
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ accountId: 1 }, { unique: true, sparse: true });
+  await users.createIndex({ signupDeviceHash: 1 }, { unique: true, sparse: true });
+  await users.createIndex({ signupIpHash: 1, createdAt: -1 });
   await transactions.createIndex({ userId: 1, createdAt: -1 });
   await captchaTasks.createIndex({ status: 1, createdAt: 1 });
   await captchaTasks.createIndex({ generationKey: 1 }, { unique: true, sparse: true });
@@ -1867,6 +1965,8 @@ async function start() {
   await gameRewards.createIndex({ rewardId: 1 }, { unique: true });
   await gameRewards.createIndex({ userId: 1, createdAt: -1 });
   await rateLimits.createIndex({ resetAt: 1 }, { expireAfterSeconds: 0 });
+  await signupAttempts.createIndex({ phone: 1 }, { unique: true });
+  await signupAttempts.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await transactions.createIndex({ userId: 1, type: 1, scheduleKey: 1 }, { unique: true, partialFilterExpression: { type: 'withdrawal', scheduleKey: { $type: 'string' } } });
   const surveyBank = buildSurveyQuestionBank();
   if (surveyBank.length !== 500) throw new Error(`Expected 500 survey questions, generated ${surveyBank.length}.`);
