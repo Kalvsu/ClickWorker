@@ -1,7 +1,6 @@
 require("dotenv").config();
 
 const express = require("express");
-const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const svgCaptcha = require("svg-captcha");
@@ -10,23 +9,76 @@ const crypto = require("crypto");
 const { MongoClient, ObjectId } = require("mongodb");
 
 const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
 const mongoUri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB || "clickworker";
 const paymongoSecretKey = process.env.PAYMONGO_SECRET_KEY || "";
 const paymongoWebhookSecret = process.env.PAYMONGO_WEBHOOK_SECRET || "";
 const appBaseUrl = String(process.env.APP_BASE_URL || "").replace(/\/$/, "");
+const isProduction = process.env.NODE_ENV === "production";
+const jwtIssuer = "clickworker-api";
+const jwtAudience = "clickworker-client";
 
-if (!mongoUri || !process.env.JWT_SECRET) {
-  throw new Error("MONGODB_URI and JWT_SECRET must be set in server/.env");
+if (!mongoUri || !process.env.JWT_SECRET || !process.env.ADMIN_PASSWORD) {
+  throw new Error("MONGODB_URI, JWT_SECRET, and ADMIN_PASSWORD must be set in the server environment.");
+}
+if (String(process.env.JWT_SECRET).length < 32) throw new Error("JWT_SECRET must contain at least 32 characters.");
+if (String(process.env.ADMIN_PASSWORD).length < 12) throw new Error("ADMIN_PASSWORD must contain at least 12 characters.");
+if (isProduction) {
+  let configuredBaseUrl;
+  try { configuredBaseUrl = new URL(appBaseUrl); } catch (_) { throw new Error("Production APP_BASE_URL must be a valid HTTPS origin."); }
+  if (configuredBaseUrl.protocol !== "https:" || configuredBaseUrl.origin !== appBaseUrl) throw new Error("Production APP_BASE_URL must be an HTTPS origin without a path.");
 }
 
 function requestOrigin(req) {
-  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
-  const protocol = forwardedProto || req.protocol || "https";
-  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "").split(",")[0].trim();
-  return appBaseUrl || (host ? `${protocol}://${host}` : "");
+  if (appBaseUrl) return appBaseUrl;
+  const host = String(req.get("host") || "").toLowerCase();
+  if (!/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(host)) return "";
+  return `${req.protocol}://${host}`;
 }
+
+function parseCookies(req) {
+  return Object.fromEntries(String(req.headers.cookie || "").split(";").map(part => {
+    const index = part.indexOf("=");
+    if (index < 1) return ["", ""];
+    try { return [part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1))]; } catch (_) { return ["", ""]; }
+  }).filter(([name]) => name));
+}
+
+function setAuthCookie(res, token) {
+  const attributes = [`cw_session=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=604800"];
+  if (isProduction) attributes.push("Secure");
+  res.setHeader("Set-Cookie", attributes.join("; "));
+}
+
+function clearAuthCookie(res) {
+  const attributes = ["cw_session=", "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
+  if (isProduction) attributes.push("Secure");
+  res.setHeader("Set-Cookie", attributes.join("; "));
+}
+
+const rateLimitBuckets = new Map();
+function rateLimit({ windowMs, max, key = req => req.ip, message = "Too many requests. Please try again later." }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const bucketKey = `${req.path}:${key(req)}`;
+    let bucket = rateLimitBuckets.get(bucketKey);
+    if (!bucket || bucket.resetAt <= now) bucket = { count: 0, resetAt: now + windowMs };
+    bucket.count += 1;
+    rateLimitBuckets.set(bucketKey, bucket);
+    res.set("RateLimit-Limit", String(max));
+    res.set("RateLimit-Remaining", String(Math.max(0, max - bucket.count)));
+    res.set("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+    if (bucket.count > max) {
+      res.set("Retry-After", String(Math.ceil((bucket.resetAt - now) / 1000)));
+      return res.status(429).json({ message });
+    }
+    next();
+  };
+}
+setInterval(() => { const now = Date.now(); for (const [key, value] of rateLimitBuckets) if (value.resetAt <= now) rateLimitBuckets.delete(key); }, 10 * 60 * 1000).unref();
 
 function paymongoAuthHeader() { return `Basic ${Buffer.from(`${paymongoSecretKey}:`).toString("base64")}`; }
 
@@ -155,11 +207,41 @@ async function reconcilePaymongoOrder(order, { cancelledReturn = false } = {}) {
   return paymentOrders.findOne({ _id: order._id });
 }
 
-app.use(cors());
+app.use((req, res, next) => {
+  if (isProduction && !req.get("Host")) return res.status(400).send("Invalid host.");
+  if (isProduction && !req.secure) return res.redirect(308, `${appBaseUrl}${req.originalUrl}`);
+  const csp = [
+    "default-src 'self'", "base-uri 'none'", "object-src 'none'", "frame-src 'none'", "frame-ancestors 'none'",
+    "script-src 'self'", "script-src-attr 'none'", "style-src 'self' 'unsafe-inline'", "font-src 'self'", "connect-src 'self'",
+    "img-src 'self' data: https://api.qrserver.com", "media-src 'self' blob:", "form-action 'self'",
+    ...(isProduction ? ["upgrade-insecure-requests"] : [])
+  ].join("; ");
+  res.set({
+    "Content-Security-Policy": csp,
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(self), microphone=(), geolocation=(), payment=()",
+    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+    "Cross-Origin-Resource-Policy": "same-origin"
+  });
+  if (isProduction) res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  if (req.path.startsWith("/api/")) res.set("Cache-Control", "no-store");
+  next();
+});
+app.use((req, res, next) => {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(req.method) || req.path === "/api/paymongo/webhook") return next();
+  const expectedOrigin = requestOrigin(req);
+  const origin = req.get("Origin");
+  const fetchSite = String(req.get("Sec-Fetch-Site") || "").toLowerCase();
+  if ((origin && origin !== expectedOrigin) || fetchSite === "cross-site") return res.status(403).json({ message: "Cross-site request blocked." });
+  next();
+});
 // Profile photos are stored as data URLs for the local prototype. Allow the
 // 3 MB binary image limit plus JSON/base64 overhead.
 app.use(express.json({ limit: "5mb", verify: (req, _res, buffer) => { if (req.originalUrl === "/api/paymongo/webhook") req.rawBody = buffer.toString("utf8"); } }));
-app.use(express.static(require("path").join(__dirname, "public")));
+app.use(express.static(require("path").join(__dirname, "public"), { dotfiles: "deny", index: "index.html", fallthrough: true }));
+app.use(/^\/(?:\.env|\.git|.*\.(?:map|bak|old|orig|sql|sqlite|pem|key|p12|pfx))$/i, (_req, res) => res.sendStatus(404));
 // Referral links load the same single-page app. The client reads the code and
 // opens the registration form with it already filled in.
 app.get("/referral", (_req, res) => res.sendFile(require("path").join(__dirname, "public", "index.html")));
@@ -190,10 +272,10 @@ const MAX_PROFILE_IMAGE_BYTES = 3 * 1024 * 1024;
 const WORKER_AGREEMENT_VERSION = "clickworker-rules-v1";
 const PAYMONGO_CHECKOUT_URL = "https://api.paymongo.com/v1/checkout_sessions";
 const PAYMONGO_CURRENCY = "PHP";
-const WITHDRAWAL_SUGGESTED_AMOUNTS = [150, 600, 1500, 4000, 10000, 30000, 100000, 250000, 700000, 2000000];
+const WITHDRAWAL_SUGGESTED_AMOUNTS = [15, 150, 600, 1500, 4000, 10000, 30000, 100000, 250000, 700000, 2000000];
 
 const adminPhone = normalizePhone(process.env.ADMIN_PHONE || "9990000000");
-const adminPassword = process.env.ADMIN_PASSWORD || "ChangeMe-Admin-2026!";
+const adminPassword = process.env.ADMIN_PASSWORD;
 
 const DEFAULT_GAME_RANK_REWARDS = [40, 25, 15, 8, 5, 3, 2, 1, 0.5, 0.5];
 function gameXpForWorker(level) { return Math.max(0, Math.round(Number(level || 0) * 10)); }
@@ -530,7 +612,8 @@ function manilaWallClock() {
 
 function withdrawalScheduleForUser(user, now = manilaWallClock()) {
   const level = Number(user.activeWorker || 0);
-  const schedule = level >= 1 && level <= 3 ? { day: 1, label: "Monday", group: "Worker 1–3" } : level >= 4 && level <= 6 ? { day: 3, label: "Wednesday", group: "Worker 4–6" } : level >= 7 && level <= 9 ? { day: 5, label: "Friday", group: "Worker 7–9" } : null;
+  const hasSignupBonus = Number(user.signupBonusBalance || 0) > 0;
+  const schedule = hasSignupBonus ? { day: 5, label: "Friday", group: "Signup bonus" } : level >= 1 && level <= 3 ? { day: 1, label: "Monday", group: "Worker 1–3" } : level >= 4 && level <= 6 ? { day: 3, label: "Wednesday", group: "Worker 4–6" } : level >= 7 && level <= 9 ? { day: 5, label: "Friday", group: "Worker 7–9" } : null;
   if (!schedule) return { eligible: false, reason: "Purchase a membership before withdrawing.", nextPeriodAt: null, daysUntilNextPeriod: null };
   const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const currentDay = today.getUTCDay();
@@ -564,10 +647,12 @@ async function generateAccountId() {
 
 async function requireAuth(req, res, next) {
   try {
-    const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    const bearer = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i)?.[1] || "";
+    const token = bearer || parseCookies(req).cw_session || "";
+    const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"], issuer: jwtIssuer, audience: jwtAudience });
     req.user = await users.findOne({ _id: new ObjectId(payload.sub) });
     if (!req.user) return res.status(401).json({ message: "Account not found." });
+    if (Number(payload.ver || 0) !== Number(req.user.tokenVersion || 0)) return res.status(401).json({ message: "Please sign in again." });
     if (req.user.banned) return res.status(403).json({ message: "This account has been banned. Contact support." });
     if (req.user.restricted) return res.status(403).json({ message: "This account is restricted. Contact support." });
     next();
@@ -584,23 +669,29 @@ function requireAdmin(req, res, next) {
 }
 
 function requireAdminAccess(req, res, next) {
-  if (process.env.ADMIN_API_KEY && req.header("X-Admin-Key") === process.env.ADMIN_API_KEY) return next();
   return requireAuth(req, res, () => requireAdmin(req, res, next));
 }
 
 app.get("/health", (_req, res) => res.json({ ok: Boolean(users) }));
 
-app.post("/api/auth/register", async (req, res) => {
+const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
+const uploadRateLimit = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, key: req => String(req.user?._id || req.ip) });
+const simulatorRateLimit = rateLimit({ windowMs: 60 * 1000, max: 10 });
+const actionRateLimit = rateLimit({ windowMs: 60 * 1000, max: 60, key: req => String(req.user?._id || req.ip) });
+app.post("/api/auth/register", authRateLimit, async (req, res) => {
   try {
     const { phone, fullName, referralCode, password } = req.body || {};
     if (!phone || !fullName || !password) {
       return res.status(400).json({ message: "All required fields must be completed." });
     }
-    if (String(password).length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters." });
+    if (String(password).length < 10 || String(password).length > 128) {
+      return res.status(400).json({ message: "Password must contain 10 to 128 characters." });
     }
 
     const normalizedPhone = normalizePhone(phone);
+    if (!/^\+639\d{9}$/.test(normalizedPhone)) return res.status(400).json({ message: "Enter a valid Philippine mobile number." });
+    const normalizedName = String(fullName).trim().replace(/\s+/g, " ");
+    if (normalizedName.length < 3 || normalizedName.length > 80 || /[\u0000-\u001f\u007f]/.test(normalizedName)) return res.status(400).json({ message: "Name must contain 3 to 80 valid characters." });
     const existing = await users.findOne({ phone: normalizedPhone });
     if (existing) return res.status(409).json({ message: "An account already exists for this phone number." });
 
@@ -612,18 +703,19 @@ app.post("/api/auth/register", async (req, res) => {
       accountId,
       inviteCode: `CW${accountId}`,
       phone: normalizedPhone,
-      fullName: String(fullName).trim(),
+      fullName: normalizedName,
       referralCode: submittedReferral,
       invitedByUserId: inviter?._id || null,
       invitedByAccountId: inviter?.accountId || "",
       passwordHash: await bcrypt.hash(String(password), 12),
       points: 0,
-      balance: 0,
+      balance: 15,
+      signupBonusBalance: 15,
       membershipLevel: "No active membership",
       activeWorker: 0,
       role: "Member",
       guidanceAcceptedAt: null,
-      activities: [{ type: "account", title: "Account created", points: 0, amount: 0, createdAt: new Date() }],
+      activities: [{ type: "signup_bonus", title: "Signup bonus", points: 0, amount: 15, createdAt: new Date() }, { type: "account", title: "Account created", points: 0, amount: 0, createdAt: new Date() }],
       createdAt: new Date()
     };
     const result = await users.insertOne(user);
@@ -634,36 +726,46 @@ app.post("/api/auth/register", async (req, res) => {
       accountId: user.accountId,
       senderType: "system",
       title: "Welcome to ClickWorker",
-      message: "Your member account is ready. System and support updates will appear here.",
+      message: "Your member account is ready. ₱15 signup bonus added to your Cash Wallet. Signup bonus withdrawals are available on Fridays.",
       readAt: null,
       createdAt: new Date()
     });
-    const token = jwt.sign({ sub: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: "7d" });
-    return res.status(201).json({ token, user: publicUser(user) });
+    const token = jwt.sign({ sub: user._id.toString(), ver: Number(user.tokenVersion || 0) }, process.env.JWT_SECRET, { algorithm: "HS256", issuer: jwtIssuer, audience: jwtAudience, expiresIn: "7d" });
+    setAuthCookie(res, token);
+    return res.status(201).json({ user: publicUser(user) });
   } catch (error) {
     console.error("register", error);
     return res.status(500).json({ message: "Unable to create the account." });
   }
 });
 
-app.post("/api/account/profile-picture", requireAuth, async (req, res) => {
+app.post("/api/account/profile-picture", requireAuth, uploadRateLimit, async (req, res) => {
   const imageDataUrl = String(req.body?.imageDataUrl || "");
   const match = /^data:image\/(png|jpe?g|webp);base64,([a-z0-9+/=]+)$/i.exec(imageDataUrl);
   const imageBytes = match ? Buffer.byteLength(match[2], "base64") : 0;
   if (!match || imageBytes === 0 || imageBytes > MAX_PROFILE_IMAGE_BYTES) {
     return res.status(400).json({ message: "Upload a PNG, JPEG, or WebP image no larger than 3 MB." });
   }
+  let normalizedImage;
+  try {
+    const input = Buffer.from(match[2], "base64");
+    const metadata = await sharp(input).metadata();
+    if (!["png", "jpeg", "webp"].includes(metadata.format) || !metadata.width || !metadata.height || metadata.width > 4096 || metadata.height > 4096) throw new Error("invalid image");
+    const output = await sharp(input, { limitInputPixels: 16_777_216 }).rotate().resize({ width: 1024, height: 1024, fit: "inside", withoutEnlargement: true }).webp({ quality: 85 }).toBuffer();
+    normalizedImage = `data:image/webp;base64,${output.toString("base64")}`;
+  } catch (_) { return res.status(400).json({ message: "The uploaded file is not a valid supported image." }); }
   const updated = await users.findOneAndUpdate(
     { _id: req.user._id },
-    { $set: { profileImageDataUrl: imageDataUrl, updatedAt: new Date() } },
+    { $set: { profileImageDataUrl: normalizedImage, updatedAt: new Date() } },
     { returnDocument: "after" }
   );
   return res.json({ message: "Profile photo updated.", user: publicUser(updated) });
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authRateLimit, async (req, res) => {
   try {
     const { phone, password } = req.body || {};
+    if (String(password || "").length > 128) return res.status(401).json({ message: "Incorrect phone number or password." });
     let user = await users.findOne({ phone: normalizePhone(phone) });
     if (!user || !(await bcrypt.compare(String(password || ""), user.passwordHash))) {
       return res.status(401).json({ message: "Incorrect phone number or password." });
@@ -676,12 +778,19 @@ app.post("/api/auth/login", async (req, res) => {
       await users.updateOne({ _id: user._id, accountId: { $exists: false } }, { $set: { accountId } });
       user = await users.findOne({ _id: user._id });
     }
-    const token = jwt.sign({ sub: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: "7d" });
-    return res.json({ token, user: publicUser(user) });
+    const token = jwt.sign({ sub: user._id.toString(), ver: Number(user.tokenVersion || 0) }, process.env.JWT_SECRET, { algorithm: "HS256", issuer: jwtIssuer, audience: jwtAudience, expiresIn: "7d" });
+    setAuthCookie(res, token);
+    return res.json({ user: publicUser(user) });
   } catch (error) {
     console.error("login", error);
     return res.status(500).json({ message: "Unable to sign in right now." });
   }
+});
+
+app.post("/api/auth/logout", requireAuth, async (req, res) => {
+  await users.updateOne({ _id: req.user._id }, { $inc: { tokenVersion: 1 }, $set: { updatedAt: new Date() } });
+  clearAuthCookie(res);
+  return res.json({ message: "Signed out." });
 });
 
 app.get("/api/account/profile", requireAuth, async (req, res) => {
@@ -887,7 +996,7 @@ app.post("/api/wallet/bank-account", requireAuth, async (req, res) => {
   return res.json({ message: "Personal withdrawal bank account saved.", bankAccount: { accountName, bankName, accountNumberMasked: maskBankAccount(accountNumber) } });
 });
 
-app.post("/api/wallet/withdrawal-password", requireAuth, async (req, res) => {
+app.post("/api/wallet/withdrawal-password", requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, max: 5, key: req => String(req.user._id) }), async (req, res) => {
   const password = String(req.body?.password || "");
   const confirmPassword = String(req.body?.confirmPassword || "");
   if (!/^\d{6}$/.test(password)) return res.status(400).json({ message: "Withdrawal password must be exactly 6 digits." });
@@ -980,7 +1089,7 @@ app.get("/api/support/messages", requireAuth, async (req, res) => {
   return res.json({ messages: items.map(item => ({ id: item._id.toString(), senderType: item.senderType, message: item.message, createdAt: item.createdAt })) });
 });
 
-app.post("/api/support/messages", requireAuth, async (req, res) => {
+app.post("/api/support/messages", requireAuth, actionRateLimit, async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message || message.length > 2000) return res.status(400).json({ message: "Message must contain 1 to 2000 characters." });
   const item = { userId: req.user._id, accountId: req.user.accountId, senderType: "member", message, createdAt: new Date() };
@@ -997,11 +1106,10 @@ app.post("/api/notifications/:id/read", requireAuth, async (req, res) => {
   } catch (_) { return res.status(400).json({ message: "Invalid notification." }); }
 });
 
-// Temporary localhost administration endpoint. Set ADMIN_API_KEY in .env and
-// send it as X-Admin-Key. Omit accountId to notify every account.
+// Administrative notifications require an authenticated administrator session.
 app.post("/api/admin/notifications", requireAdminAccess, async (req, res) => {
-  const title = String(req.body?.title || "").trim();
-  const message = String(req.body?.message || "").trim();
+  const title = String(req.body?.title || "").trim().slice(0, 120);
+  const message = String(req.body?.message || "").trim().slice(0, 4000);
   if (!title || !message) return res.status(400).json({ message: "Title and message are required." });
   const imageDataUrl = String(req.body?.imageDataUrl || "");
   if (imageDataUrl && (!/^data:image\/png;base64,[a-z0-9+/=]+$/i.test(imageDataUrl) || imageDataUrl.length > 2_200_000)) {
@@ -1115,9 +1223,11 @@ app.get("/api/admin/overview", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 app.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
-  const query = String(req.query.q || "").trim();
+  const query = String(req.query.q || "").trim().slice(0, 80);
   const accountId = query.replace(/^CW/i, "");
-  const match = query ? { $or: [{ accountId }, { username: { $regex: query, $options: "i" } }, { usernameLower: query.toLowerCase() }, { fullName: { $regex: query, $options: "i" } }, { phone: { $regex: query.replace(/[^0-9+]/g, "") } }] } : {};
+  const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const phoneQuery = query.replace(/[^0-9+]/g, "");
+  const match = query ? { $or: [{ accountId }, { usernameLower: query.toLowerCase() }, { username: { $regex: escapedQuery, $options: "i" } }, { fullName: { $regex: escapedQuery, $options: "i" } }, ...(phoneQuery ? [{ phone: { $regex: phoneQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") } }] : [])] } : {};
   const items = await users.find(match).sort({ createdAt: -1 }).limit(200).toArray();
   return res.json({ users: items.map(safeUserSummary) });
 });
@@ -1169,7 +1279,7 @@ app.get("/api/admin/withdrawals", requireAuth, requireAdmin, async (_req, res) =
   const accountIds = [...new Set(items.map(item => item.accountId).filter(Boolean))];
   const owners = await users.find({ accountId: { $in: accountIds } }).project({ accountId: 1, fullName: 1 }).toArray();
   const names = new Map(owners.map(item => [item.accountId, item.fullName]));
-  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, scheduleKey: item.scheduleKey || "", scheduledDay: item.scheduledDay || "", createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, bankAccount: { accountName: item.bankAccountName || "", bankName: item.bankName || item.paymentMethod || "", accountNumber: item.bankAccountNumber || "", accountNumberMasked: item.bankAccountNumberMasked || "" }, scheduleKey: item.scheduleKey || "", scheduledDay: item.scheduledDay || "", createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
 });
 
 app.patch("/api/admin/withdrawals/:id", requireAuth, requireAdmin, async (req, res) => {
@@ -1196,7 +1306,7 @@ app.patch("/api/admin/withdrawals/:id", requireAuth, requireAdmin, async (req, r
 });
 
 // Optional website generator. Android task claims self-generate when queue is empty.
-app.post("/api/simulator/captcha", async (req, res) => {
+app.post("/api/simulator/captcha", simulatorRateLimit, async (req, res) => {
   const generationKey = String(req.body?.requestId || require("crypto").randomUUID()).slice(0, 120);
   const duplicate = await captchaTasks.findOne({ generationKey });
   if (duplicate) return res.json({ task: { id: duplicate._id.toString(), imageUrl: `/api/simulator/captcha/${duplicate._id.toString()}/image`, status: duplicate.status, rewardPoints: duplicate.rewardPoints, createdAt: duplicate.createdAt }, deduplicated: true });
@@ -1258,6 +1368,20 @@ app.get("/api/tasks/captcha/next", requireAuth, async (req, res) => {
     console.error("captcha claim", error);
     return res.status(500).json({ message: "Unable to claim a practice challenge." });
   }
+});
+
+app.post("/api/tasks/captcha/:id/skip", requireAuth, async (req, res) => {
+  try {
+    const id = new (require("mongodb").ObjectId)(req.params.id);
+    const task = await captchaTasks.findOneAndUpdate(
+      { _id: id, assignedTo: req.user._id, status: "assigned" },
+      { $set: { status: "skipped", skippedAt: new Date() } },
+      { returnDocument: "before" }
+    );
+    if (!task) return res.status(404).json({ message: "Assigned practice task is no longer available." });
+    await captchaUsage.updateOne({ userId: req.user._id, dayKey: task.dayKey || captchaDayKey(), claimed: { $gt: 0 } }, { $inc: { claimed: -1 }, $set: { updatedAt: new Date() } });
+    return res.json({ message: "Task skipped. Loading another task." });
+  } catch (_) { return res.status(400).json({ message: "Invalid practice task." }); }
 });
 
 app.post("/api/tasks/captcha/:id/submit", requireAuth, async (req, res) => {
@@ -1482,10 +1606,12 @@ app.post("/api/wallet/paymongo/checkout", requireAuth, async (req, res) => {
     const checkout = await paymongoRequest("/v1/checkout_sessions", "POST", { data: { attributes: { billing: { name: req.user.fullName || "ClickWorker Member", phone: req.user.phone || undefined }, cancel_url: `${origin}/?payment=cancelled&order=${created.insertedId}`, success_url: `${origin}/?payment=return&order=${created.insertedId}`, client_reference_number: created.insertedId.toString(), reference_number: referenceNumber, metadata: { order_id: created.insertedId.toString() }, description: "ClickWorker Cash Wallet top-up", line_items: [{ amount: order.amountCentavos, currency: PAYMONGO_CURRENCY, name: "ClickWorker Cash Wallet", quantity: 1 }], payment_method_types: ["gcash", "qrph"], send_email_receipt: false, show_description: true, show_line_items: true } } });
     const attributes = checkout?.data?.attributes || {};
     const checkoutUrl = attributes.checkout_url;
-    if (!checkoutUrl) throw new Error("PayMongo did not return a checkout URL.");
+    let parsedCheckoutUrl;
+    try { parsedCheckoutUrl = new URL(checkoutUrl); } catch (_) { throw new Error("PayMongo returned an invalid checkout URL."); }
+    if (parsedCheckoutUrl.protocol !== "https:" || !/(^|\.)paymongo\.com$/i.test(parsedCheckoutUrl.hostname)) throw new Error("PayMongo returned an untrusted checkout URL.");
     const checkoutExpiresAt = attributes.expires_at ? new Date(Number(attributes.expires_at) * 1000) : new Date(Date.now() + 24 * 60 * 60 * 1000);
     await paymentOrders.updateOne({ _id: order._id }, { $set: { checkoutSessionId: checkout.data.id, checkoutUrl, referenceNumber, checkoutExpiresAt, updatedAt: new Date() } });
-    return res.status(201).json({ orderId: order._id.toString(), checkoutUrl, message: "Redirecting to PayMongo secure checkout." });
+    return res.status(201).json({ orderId: order._id.toString(), checkoutUrl: parsedCheckoutUrl.href, message: "Redirecting to PayMongo secure checkout." });
   } catch (error) {
     await paymentOrders.updateOne({ _id: order._id }, { $set: { status: "failed", failureReason: String(error.message || "Checkout setup failed.").slice(0, 500), updatedAt: new Date() } });
     return res.status(error.status || 502).json({ message: error.message || "Could not start PayMongo checkout." });
@@ -1530,7 +1656,7 @@ app.post("/api/paymongo/webhook", async (req, res) => {
     return res.status(200).json({ received: true });
   } catch (error) { console.error("paymongo webhook", error); return res.status(500).json({ message: "Webhook processing failed." }); }
 });
-app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
+app.post("/api/wallet/withdraw", requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, max: 5, key: req => String(req.user._id), message: "Too many withdrawal attempts. Please wait and try again." }), async (req, res) => {
   const amount = Number(req.body?.amount);
   const withdrawalPassword = String(req.body?.withdrawalPassword || "");
   if (!Number.isFinite(amount) || !WITHDRAWAL_SUGGESTED_AMOUNTS.includes(amount)) return res.status(400).json({ message: "Select one of the available suggested withdrawal amounts." });
@@ -1543,34 +1669,27 @@ app.post("/api/wallet/withdraw", requireAuth, async (req, res) => {
   const alreadyRequested = await transactions.findOne({ userId: req.user._id, type: "withdrawal", scheduleKey: schedule.periodKey });
   if (alreadyRequested) return res.status(409).json({ message: "You have already submitted a withdrawal request for this scheduled period." });
   const now = new Date();
-  const request = { userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), scheduleKey: schedule.periodKey, scheduledDay: schedule.schedule.label, createdAt: now };
+  const signupBonusUsed = Math.min(amount, Math.max(0, Number(req.user.signupBonusBalance || 0)));
+  const request = { userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumber: String(req.user.withdrawalBank.accountNumber), bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), scheduleKey: schedule.periodKey, scheduledDay: schedule.schedule.label, createdAt: now };
   const session = mongoClient.startSession();
   try {
     let updated;
     await session.withTransaction(async () => {
       try { await transactions.insertOne(request, { session }); } catch (error) { if (error?.code === 11000) { const duplicate = new Error("You have already submitted a withdrawal request for this scheduled period."); duplicate.status = 409; throw duplicate; } throw error; }
-      updated = await users.findOneAndUpdate({ _id: req.user._id, balance: { $gte: amount } }, { $inc: { balance: -amount }, $push: { activities: { type: "withdraw", title: "Bank withdrawal request", amount: -amount, points: 0, status: "pending", scheduleKey: schedule.periodKey, createdAt: now } } }, { returnDocument: "after", session });
+      const increments = { balance: -amount };
+      if (signupBonusUsed) increments.signupBonusBalance = -signupBonusUsed;
+      updated = await users.findOneAndUpdate({ _id: req.user._id, balance: { $gte: amount } }, { $inc: increments, $push: { activities: { type: "withdraw", title: "Bank withdrawal request", amount: -amount, points: 0, status: "pending", scheduleKey: schedule.periodKey, createdAt: now } } }, { returnDocument: "after", session });
       if (!updated) { const error = new Error("Insufficient balance."); error.status = 400; throw error; }
     });
     return res.json({ message: "Withdrawal request submitted for your scheduled period.", user: publicUser(updated) });
   } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not submit withdrawal." }); } finally { await session.endSession(); }
 });
-app.post("/api/activities/complete", requireAuth, async (req, res) => {
-  const allowed = { daily_checkin: ["Daily check-in", 5], task_center: ["Task completed", 20], share: ["Share & Earn", 10] };
-  const reward = allowed[String(req.body?.activity)];
-  if (!reward) return res.status(400).json({ message: "Unknown activity." });
-  const [title, points] = reward;
-  const activity = { type: "reward", title, points, amount: 0, createdAt: new Date() };
-  await users.updateOne({ _id: req.user._id }, { $inc: { points }, $push: { activities: activity } });
-  const updated = await users.findOne({ _id: req.user._id });
-  return res.json({ message: `You earned ${points} points.`, user: publicUser(updated) });
-});
-
 async function gameMemberView(user) {
   await settleWeeklyGame();
   const game = await currentGameConfig();
   const team = await gameTeams.findOne({ memberIds: user._id });
   const invites = await gameInvites.find({ inviteeId: user._id, status: "pending" }).sort({ createdAt: -1 }).toArray();
+  await Promise.all(invites.map(ensureGameInviteNotification));
   const leaderboard = game?.deploymentId ? await gameScores.find({ deploymentId: game.deploymentId }).sort({ totalXp: -1, updatedAt: 1 }).limit(10).toArray() : [];
   const score = game?.deploymentId && team ? await gameScores.findOne({ deploymentId: game.deploymentId, teamId: team._id }) : null;
   const earningsRows = await gameRewards.find({ userId: user._id }).sort({ createdAt: -1 }).limit(100).toArray();
@@ -1582,6 +1701,15 @@ async function gameMemberView(user) {
     gameEarnings: Number(earningsRows.reduce((sum, item) => sum + Number(item.points || 0), 0).toFixed(2)),
     earnings: earningsRows.map(item => ({ id: item._id.toString(), title: item.teamName, rank: item.rank, points: item.points, createdAt: item.createdAt })),
   };
+}
+
+async function ensureGameInviteNotification(invite) {
+  if (!invite?._id || !invite?.inviteeId) return;
+  await notifications.updateOne(
+    { type: "game_invitation", inviteId: invite._id, userId: invite.inviteeId },
+    { $setOnInsert: { userId: invite.inviteeId, accountId: invite.inviteeAccountId, senderType: "system", type: "game_invitation", inviteId: invite._id, title: "Weekly game team invitation", message: `${invite.inviterAccountId} invited you to join team ${invite.teamName}. Open Weekly Games to accept or decline.`, readAt: null, createdAt: invite.createdAt || new Date() } },
+    { upsert: true }
+  );
 }
 
 app.get("/api/games/weekly", requireAuth, async (req, res) => res.json(await gameMemberView(req.user)));
@@ -1602,8 +1730,17 @@ app.post("/api/games/teams/invite", requireAuth, async (req, res) => {
   if (!invitee) return res.status(404).json({ message: "UID was not found." });
   if (String(invitee._id) === String(req.user._id)) return res.status(400).json({ message: "You are already on this team." });
   if (await gameTeams.findOne({ memberIds: invitee._id })) return res.status(409).json({ message: "That member already belongs to a team." });
-  try { await gameInvites.insertOne({ teamId: team._id, teamName: team.name, inviterId: req.user._id, inviterAccountId: req.user.accountId, inviteeId: invitee._id, inviteeAccountId: invitee.accountId, status: "pending", createdAt: new Date() }); }
-  catch (error) { if (error?.code === 11000) return res.status(409).json({ message: "Invitation already sent." }); throw error; }
+  const invite = { teamId: team._id, teamName: team.name, inviterId: req.user._id, inviterAccountId: req.user.accountId, inviteeId: invitee._id, inviteeAccountId: invitee.accountId, status: "pending", createdAt: new Date() };
+  try { const result = await gameInvites.insertOne(invite); invite._id = result.insertedId; }
+  catch (error) {
+    if (error?.code === 11000) {
+      const existing = await gameInvites.findOne({ teamId: team._id, inviteeId: invitee._id, status: "pending" });
+      if (existing) await ensureGameInviteNotification(existing);
+      return res.status(409).json({ message: "Invitation already sent." });
+    }
+    throw error;
+  }
+  await ensureGameInviteNotification(invite);
   return res.status(201).json({ message: `Invitation sent to ${invitee.accountId}.` });
 });
 app.post("/api/games/invitations/:id/respond", requireAuth, async (req, res) => {
@@ -1638,6 +1775,18 @@ app.put("/api/admin/games/weekly", requireAuth, requireAdmin, async (req, res) =
   const active = Boolean(req.body?.active); const deploymentId = active ? `weekly-${Date.now()}` : String((await currentGameConfig(true))?.deploymentId || "");
   await gameConfigs.updateOne({ key: "weekly" }, { $set: { key: "weekly", deploymentId, title, description, rules, criteria, prizePool: Number(prizePool.toFixed(2)), maxTeamSize, startAt, endAt, rankRewards, status: active ? "active" : "draft", updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
   return res.json({ message: active ? "Weekly game deployed." : "Weekly game saved as draft.", game: publicGameConfig(await currentGameConfig(true), true) });
+});
+
+app.post("/api/admin/games/weekly/end", requireAuth, requireAdmin, async (_req, res) => {
+  const now = new Date();
+  const ended = await gameConfigs.findOneAndUpdate(
+    { key: "weekly", status: "active" },
+    { $set: { status: "settling", endAt: now, updatedAt: now, endedByAdminAt: now } },
+    { returnDocument: "after" }
+  );
+  if (!ended) return res.status(409).json({ message: "No active weekly game to end." });
+  await settleWeeklyGame();
+  return res.json({ message: "Weekly game ended and rewards were settled.", game: publicGameConfig(await currentGameConfig(true), true) });
 });
 
 async function start() {

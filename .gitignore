@@ -4,6 +4,17 @@ node_modules/
 output/
 *.log
 server-runtime.*.log
+*.map
+*.bak
+*.old
+*.orig
+*.sql
+*.sqlite
+*.db
+*.pem
+*.key
+*.p12
+*.pfx
 
 # OS/editor files
 .DS_Store
