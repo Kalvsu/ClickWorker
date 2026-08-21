@@ -302,6 +302,17 @@ app.use((req, res, next) => {
 // 3 MB binary image limit plus JSON/base64 overhead.
 app.use(express.json({ limit: "5mb", verify: (req, _res, buffer) => { if (req.originalUrl === "/api/paymongo/webhook") req.rawBody = buffer.toString("utf8"); } }));
 app.use(express.static(require("path").join(__dirname, "public"), { dotfiles: "deny", index: "index.html", fallthrough: true }));
+app.get("/api/download/android", (_req, res) => {
+  const apkPath = require("path").join(__dirname, "build", "ClickWorker-domain-debug.apk");
+  return res.download(apkPath, "ClickWorker.apk", {
+    headers: {
+      "Content-Type": "application/vnd.android.package-archive",
+      "Cache-Control": "public, max-age=3600"
+    }
+  }, error => {
+    if (error && !res.headersSent) return res.status(error.statusCode === 404 ? 404 : 500).json({ message: "Android app download is unavailable." });
+  });
+});
 app.use(/^\/(?:\.env|\.git|.*\.(?:map|bak|old|orig|sql|sqlite|pem|key|p12|pfx))$/i, (_req, res) => res.sendStatus(404));
 // Referral links load the same single-page app. The client reads the code and
 // opens the registration form with it already filled in.

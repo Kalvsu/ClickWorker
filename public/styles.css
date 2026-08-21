@@ -130,4 +130,4 @@ body.auth-open{overflow:hidden}.landing-view{min-height:100vh;background:#fff;co
 
 .payment-return-link{display:inline-block;margin-top:20px;text-decoration:none}
 
-.pi.about:before{content:'i'}
+.pi.about:before{content:'i'}.pi.download:before{content:'↓'}
