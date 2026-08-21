@@ -57,13 +57,13 @@ function appendSetCookie(res, value) {
 }
 
 function setAuthCookie(res, token) {
-  const attributes = [`cw_session=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=604800"];
+  const attributes = [`cw_session=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=604800"];
   if (isProduction) attributes.push("Secure");
   appendSetCookie(res, attributes.join("; "));
 }
 
 function clearAuthCookie(res) {
-  const attributes = ["cw_session=", "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
+  const attributes = ["cw_session=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
   if (isProduction) attributes.push("Secure");
   appendSetCookie(res, attributes.join("; "));
 }
