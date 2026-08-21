@@ -19,6 +19,7 @@ const paymongoWebhookSecret = process.env.PAYMONGO_WEBHOOK_SECRET || "";
 const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID || "";
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || "";
 const twilioVerifyServiceSid = process.env.TWILIO_VERIFY_SERVICE_SID || "";
+const registrationSmsRequired = String(process.env.REGISTRATION_SMS_REQUIRED || "false").toLowerCase() === "true";
 const appBaseUrl = String(process.env.APP_BASE_URL || "").replace(/\/$/, "");
 const isProduction = process.env.NODE_ENV === "production";
 const jwtIssuer = "clickworker-api";
@@ -741,10 +742,11 @@ const otpSendRateLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, key: req 
 const uploadRateLimit = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, key: req => String(req.user?._id || req.ip) });
 const simulatorRateLimit = rateLimit({ windowMs: 60 * 1000, max: 10 });
 const actionRateLimit = rateLimit({ windowMs: 60 * 1000, max: 60, key: req => String(req.user?._id || req.ip) });
-app.get("/api/auth/registration-config", (_req, res) => res.json({ otpRequired: true, otpConfigured: otpConfigured() }));
+app.get("/api/auth/registration-config", (_req, res) => res.json({ otpRequired: registrationSmsRequired, otpConfigured: registrationSmsRequired && otpConfigured() }));
 
 app.post("/api/auth/register/send-otp", otpSendRateLimit, async (req, res) => {
   try {
+    if (!registrationSmsRequired) return res.status(404).json({ message: "SMS verification is temporarily disabled." });
     const normalizedPhone = normalizePhone(req.body?.phone);
     if (!/^\+639\d{9}$/.test(normalizedPhone)) return res.status(400).json({ message: "Enter a valid Philippine mobile number." });
     if (await users.findOne({ phone: normalizedPhone })) return res.status(409).json({ message: "An account already exists for this phone number." });
@@ -765,7 +767,7 @@ app.post("/api/auth/register/send-otp", otpSendRateLimit, async (req, res) => {
 app.post("/api/auth/register", authRateLimit, async (req, res) => {
   try {
     const { phone, fullName, referralCode, password, otp } = req.body || {};
-    if (!phone || !fullName || !password || !otp) {
+    if (!phone || !fullName || !password || (registrationSmsRequired && !otp)) {
       return res.status(400).json({ message: "All required fields must be completed." });
     }
     if (String(password).length < 10 || String(password).length > 128) {
@@ -783,10 +785,12 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
     if (await users.findOne({ signupDeviceHash: deviceHash })) return res.status(409).json({ message: "This device already has a registered account. Contact support if this is a shared device." });
     const recentNetworkSignups = await users.countDocuments({ signupIpHash: ipHash, role: { $ne: "Admin" }, createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
     if (recentNetworkSignups >= 3) return res.status(429).json({ message: "Too many accounts were recently created from this network. Try later or contact support." });
-    const pendingOtp = await signupAttempts.findOne({ phone: normalizedPhone, deviceHash, status: "pending", expiresAt: { $gt: new Date() } });
-    if (!pendingOtp) return res.status(400).json({ message: "Request a new SMS verification code first." });
-    const verification = await twilioVerify("/VerificationCheck", { To: normalizedPhone, Code: String(otp).replace(/\D/g, "").slice(0, 10) });
-    if (verification.status !== "approved") return res.status(400).json({ message: "The verification code is incorrect or expired." });
+    if (registrationSmsRequired) {
+      const pendingOtp = await signupAttempts.findOne({ phone: normalizedPhone, deviceHash, status: "pending", expiresAt: { $gt: new Date() } });
+      if (!pendingOtp) return res.status(400).json({ message: "Request a new SMS verification code first." });
+      const verification = await twilioVerify("/VerificationCheck", { To: normalizedPhone, Code: String(otp).replace(/\D/g, "").slice(0, 10) });
+      if (verification.status !== "approved") return res.status(400).json({ message: "The verification code is incorrect or expired." });
+    }
 
     const accountId = await generateAccountId();
     const submittedReferral = String(referralCode || "").trim().toUpperCase();
@@ -801,7 +805,8 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
       invitedByUserId: inviter?._id || null,
       invitedByAccountId: inviter?.accountId || "",
       passwordHash: await bcrypt.hash(String(password), 12),
-      phoneVerifiedAt: new Date(),
+      phoneVerifiedAt: registrationSmsRequired ? new Date() : null,
+      phoneVerificationBypassedAt: registrationSmsRequired ? null : new Date(),
       signupDeviceHash: deviceHash,
       signupIpHash: ipHash,
       points: 0,
@@ -816,7 +821,7 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
     };
     const result = await users.insertOne(user);
     user._id = result.insertedId;
-    await signupAttempts.updateOne({ phone: normalizedPhone }, { $set: { status: "used", usedAt: new Date(), expiresAt: new Date() } });
+    if (registrationSmsRequired) await signupAttempts.updateOne({ phone: normalizedPhone }, { $set: { status: "used", usedAt: new Date(), expiresAt: new Date() } });
     if (inviter) await users.updateOne({ _id: inviter._id }, { $inc: { referralCount: 1 } });
     await notifications.insertOne({
       userId: user._id,
