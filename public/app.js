@@ -55,7 +55,7 @@ function toast(message, error=false) { const node=$('#toast'); node.textContent=
 async function api(path, options={}) {
   const response = await fetch(path,{...options,credentials:'same-origin',headers:{'Content-Type':'application/json',...(state.token?{Authorization:`Bearer ${state.token}`} : {}),...(options.headers||{})}});
   const type=response.headers.get('content-type')||''; const data=type.includes('json')?await response.json():await response.text();
-  if (!response.ok) { if(response.status===401 && !path.startsWith('/api/auth/')){state.user=null;showAuth();} throw new Error(data.message||data||'Request failed.'); } return data;
+  if (!response.ok) { if(response.status===401 && !path.startsWith('/api/auth/')){state.user=null;showAuth();}const fallback=response.status===503?'The server is temporarily unavailable. Please try again in a moment.':'Request failed.';const message=typeof data==='object'?data.message:String(data||'');throw new Error(/^\s*<!doctype|^\s*<html/i.test(message)?fallback:message||fallback); } return data;
 }
 function userInitials(user){return (user?.fullName||'CW').split(/\s+/).map(x=>x[0]).join('').slice(0,2).toUpperCase();}
 function profileImage(user,cls=''){const initials=userInitials(user);return user?.profileImageDataUrl?`<img class="${cls}" src="${user.profileImageDataUrl}" alt="${esc(user.fullName||'Member')} profile photo">`:esc(initials);}

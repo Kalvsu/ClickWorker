@@ -1629,7 +1629,9 @@ app.post("/api/workers/agreement", requireAuth, async (req, res) => {
   }
 
   const acceptedAt = new Date();
+  const agreementId = crypto.randomUUID();
   const agreement = {
+    agreementId,
     userId: req.user._id,
     accountId: req.user.accountId,
     workerLevel,
@@ -1653,14 +1655,19 @@ app.post("/api/workers/agreement", requireAuth, async (req, res) => {
     usedAt: null,
     applicationTransactionId: null
   };
-  const result = await workerAgreements.insertOne(agreement);
-  return res.status(201).json({
-    message: "Agreement accepted. You may now apply for this Worker role.",
-    agreement: {
-      id: result.insertedId.toString(), workerLevel, membershipLevel: plan.membershipLevel,
-      agreementVersion: WORKER_AGREEMENT_VERSION, acceptedAt
-    }
-  });
+  try {
+    const result = await workerAgreements.insertOne(agreement);
+    return res.status(201).json({
+      message: "Agreement accepted. You may now apply for this Worker role.",
+      agreement: {
+        id: result.insertedId.toString(), agreementId, workerLevel, membershipLevel: plan.membershipLevel,
+        agreementVersion: WORKER_AGREEMENT_VERSION, acceptedAt
+      }
+    });
+  } catch (error) {
+    console.error("worker agreement", error);
+    return res.status(500).json({ message: "Could not save the Worker agreement. Please try again." });
+  }
 });
 
 app.post("/api/workers/apply", requireAuth, async (req, res) => {
@@ -1671,7 +1678,7 @@ app.post("/api/workers/apply", requireAuth, async (req, res) => {
 
   const appliedAt = new Date();
   const membershipExpiresAt = new Date(appliedAt.getTime() + 360 * 24 * 60 * 60 * 1000);
-  const session = mongoClient.startSession(); let referralApplied = false;
+  const session = mongoClient.startSession(); let referralApplied = false; let claimedAgreement = null;
   try {
     await session.withTransaction(async () => {
       const acceptedAgreement = await workerAgreements.findOneAndUpdate(
@@ -1680,6 +1687,7 @@ app.post("/api/workers/apply", requireAuth, async (req, res) => {
         { sort: { acceptedAt: -1 }, returnDocument: "before", session }
       );
       if (!acceptedAgreement) { const error = new Error("Read, accept, and electronically sign the Worker agreement before applying."); error.status = 400; throw error; }
+      claimedAgreement = acceptedAgreement;
       const agreementId = acceptedAgreement._id.toString();
       const agreementRecord = { id: agreementId, version: acceptedAgreement.agreementVersion, signerName: acceptedAgreement.signerName, acceptedAt: acceptedAgreement.acceptedAt, usedAt: appliedAt };
       const debit = await users.updateOne(
@@ -1695,7 +1703,10 @@ app.post("/api/workers/apply", requireAuth, async (req, res) => {
         try { await referralRewards.insertOne({ rewardId, inviterUserId: req.user.invitedByUserId, newMemberUserId: req.user._id, newMemberAccountId: req.user.accountId, workerLevel, referralPercent: plan.referralPercent, referralBonus: plan.referralBonus, starterShare: plan.starterShare, inviterShare: plan.inviterShare, createdAt: appliedAt }, { session }); await users.updateOne({ _id: req.user._id }, { $inc: { balance: plan.starterShare }, $set: { referralRewardAppliedAt: appliedAt }, $push: { activities: { type: "referral_starter_bonus", title: "Referral starter balance", amount: plan.starterShare, points: 0, createdAt: appliedAt } } }, { session }); await users.updateOne({ _id: req.user.invitedByUserId }, { $inc: { balance: plan.inviterShare, referralEarnings: plan.inviterShare }, $push: { activities: { type: "referral_bonus", title: `Referral reward from ${req.user.accountId}`, amount: plan.inviterShare, points: 0, createdAt: appliedAt } } }, { session }); await transactions.insertMany([{ userId: req.user._id, accountId: req.user.accountId, type: "referral_starter_bonus", status: "completed", amount: plan.starterShare, paymentMethod: "Referral", description: `40% starter balance from Worker ${workerLevel} referral bonus`, createdAt: appliedAt }, { userId: req.user.invitedByUserId, type: "referral_bonus", status: "completed", amount: plan.inviterShare, paymentMethod: "Referral", description: `60% referral reward from account ${req.user.accountId}`, createdAt: appliedAt }], { session }); referralApplied = true; } catch (error) { if (error?.code !== 11000) throw error; }
       }
     });
-  } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not complete worker application." }); } finally { await session.endSession(); }
+  } catch (error) {
+    if (claimedAgreement?._id) await workerAgreements.updateOne({ _id: claimedAgreement._id, applicationTransactionId: null }, { $set: { status: "accepted", usedAt: null } }).catch(() => {});
+    return res.status(error.status || 400).json({ message: error.message || "Could not complete worker application." });
+  } finally { await session.endSession(); }
   const updated = await users.findOne({ _id: req.user._id });
   return res.json({ message: `Application accepted for ${plan.membershipLevel}. Tasks are now unlocked.${referralApplied ? ` ₱${plan.starterShare.toFixed(2)} referral starter balance added.` : ""}`, user: publicUser(updated), transaction: { type: "worker_application", status: "completed", amount: -plan.cost } });
 });
