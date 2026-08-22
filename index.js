@@ -373,6 +373,23 @@ async function activeWeeklyGame() {
   const now = new Date();
   return gameConfigs.findOne({ key: "weekly", status: "active", startAt: { $lte: now }, endAt: { $gt: now } });
 }
+async function awardMysteryVaultReferralTickets(member, workerLevel, session) {
+  const ticketCount = Math.min(10, Math.max(0, Math.floor(Number(workerLevel || 0))));
+  if (!member?.invitedByUserId || !ticketCount) return 0;
+  const options = { returnDocument: "before", ...(session ? { session } : {}) };
+  const claimed = await users.findOneAndUpdate(
+    { _id: member._id, invitedByUserId: member.invitedByUserId, mysteryVaultReferralTicketAwardedAt: { $exists: false } },
+    { $set: { mysteryVaultReferralTicketAwardedAt: new Date(), mysteryVaultReferralTicketCount: ticketCount } },
+    options
+  );
+  if (!claimed) return 0;
+  await users.updateOne(
+    { _id: member.invitedByUserId },
+    { $inc: { mysteryVaultTickets: ticketCount }, $push: { activities: { type: "mystery_vault_referral_ticket", title: `Mystery Vault tickets from ${member.accountId}'s Worker ${workerLevel}`, points: 0, amount: 0, tickets: ticketCount, sourceAccountId: member.accountId, createdAt: new Date() } } },
+    session ? { session } : undefined
+  );
+  return ticketCount;
+}
 async function awardWeeklyGameXp(user, sourceId, sourceTitle, session) {
   if (!WEEKLY_TEAM_GAME_AVAILABLE) return 0;
   const now = new Date();
@@ -874,13 +891,7 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
     const result = await users.insertOne(user);
     user._id = result.insertedId;
     if (registrationSmsRequired) await signupAttempts.updateOne({ phone: normalizedPhone }, { $set: { status: "used", usedAt: new Date(), expiresAt: new Date() } });
-    if (inviter) {
-      const ticketReward = Math.max(0, Math.floor(Number(inviter.activeWorker || 0)));
-      await users.updateOne({ _id: inviter._id }, {
-        $inc: { referralCount: 1, mysteryVaultTickets: ticketReward },
-        ...(ticketReward ? { $push: { activities: { type: "mystery_vault_referral_ticket", title: `Mystery Vault referral tickets from ${accountId}`, points: 0, amount: 0, tickets: ticketReward, sourceAccountId: accountId, createdAt: new Date() } } } : {})
-      });
-    }
+    if (inviter) await users.updateOne({ _id: inviter._id }, { $inc: { referralCount: 1 } });
     await notifications.insertOne({
       userId: user._id,
       accountId: user.accountId,
@@ -1867,6 +1878,7 @@ app.post("/api/workers/apply", requireAuth, async (req, res) => {
       if (debit.modifiedCount !== 1) { const error = new Error("Insufficient Cash Wallet balance. Deposit funds before applying for this worker."); error.status = 400; throw error; }
       const transactionResult = await transactions.insertOne({ userId: req.user._id, accountId: req.user.accountId, type: "worker_application", status: "completed", amount: -plan.cost, paymentMethod: "Cash Wallet", description: `Applied for ${plan.membershipLevel} using Cash Wallet`, workerLevel, agreementId, agreementVersion: acceptedAgreement.agreementVersion, createdAt: appliedAt }, { session });
       await workerAgreements.updateOne({ _id: acceptedAgreement._id }, { $set: { applicationTransactionId: transactionResult.insertedId, appliedAt } }, { session });
+      const vaultTicketCount = await awardMysteryVaultReferralTickets(req.user, workerLevel, session);
       if (req.user.invitedByUserId && !req.user.referralRewardAppliedAt) {
         const rewardId = `${req.user._id.toString()}:first-membership`;
         try { await referralRewards.insertOne({ rewardId, inviterUserId: req.user.invitedByUserId, newMemberUserId: req.user._id, newMemberAccountId: req.user.accountId, workerLevel, referralPercent: plan.referralPercent, referralBonus: plan.referralBonus, starterShare: plan.starterShare, inviterShare: plan.inviterShare, createdAt: appliedAt }, { session }); await users.updateOne({ _id: req.user._id }, { $inc: { balance: plan.starterShare }, $set: { referralRewardAppliedAt: appliedAt }, $push: { activities: { type: "referral_starter_bonus", title: "Referral starter balance", amount: plan.starterShare, points: 0, createdAt: appliedAt } } }, { session }); await users.updateOne({ _id: req.user.invitedByUserId }, { $inc: { balance: plan.inviterShare, referralEarnings: plan.inviterShare }, $push: { activities: { type: "referral_bonus", title: `Referral reward from ${req.user.accountId}`, amount: plan.inviterShare, points: 0, createdAt: appliedAt } } }, { session }); await transactions.insertMany([{ userId: req.user._id, accountId: req.user.accountId, type: "referral_starter_bonus", status: "completed", amount: plan.starterShare, paymentMethod: "Referral", description: `40% starter balance from Worker ${workerLevel} referral bonus`, createdAt: appliedAt }, { userId: req.user.invitedByUserId, type: "referral_bonus", status: "completed", amount: plan.inviterShare, paymentMethod: "Referral", description: `60% referral reward from account ${req.user.accountId}`, createdAt: appliedAt }], { session }); referralApplied = true; } catch (error) { if (error?.code !== 11000) throw error; }
@@ -2211,6 +2223,10 @@ async function start() {
   await gameRewards.createIndex({ rewardId: 1 }, { unique: true });
   await gameRewards.createIndex({ userId: 1, createdAt: -1 });
   await vaultPicks.createIndex({ userId: 1 }, { unique: true });
+  // Backfill tickets for referrals who bought a Worker before Mystery Vault
+  // launched. The per-member claim marker makes this safe on every restart.
+  const eligibleVaultReferrals = await users.find({ invitedByUserId: { $ne: null }, activeWorker: { $gte: 1 }, mysteryVaultReferralTicketAwardedAt: { $exists: false } }).project({ _id: 1, accountId: 1, invitedByUserId: 1, activeWorker: 1 }).toArray();
+  for (const member of eligibleVaultReferrals) await awardMysteryVaultReferralTickets(member, member.activeWorker);
   await rateLimits.createIndex({ resetAt: 1 }, { expireAfterSeconds: 0 });
   await signupAttempts.createIndex({ phone: 1 }, { unique: true });
   await signupAttempts.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
