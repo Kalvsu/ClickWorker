@@ -1398,7 +1398,12 @@ app.get("/api/admin/withdrawals", requireAuth, requireAdmin, async (_req, res) =
     // Older transactions did not snapshot the bank details. In the admin-only
     // payout list, use the member's currently linked account so it remains payable.
     const fallbackBank = owner?.withdrawalBank || {};
-    const accountNumber = item.bankAccountNumber || String(fallbackBank.accountNumber || "");
+    const storedAccountNumber = String(item.bankAccountNumber || "").replace(/[\s-]/g, "");
+    // Some legacy rows stored the masked display value (for example ••••5939)
+    // instead of the actual number. Never return that as an admin payout value.
+    const accountNumber = /^\d{6,20}$/.test(storedAccountNumber)
+      ? storedAccountNumber
+      : String(fallbackBank.accountNumber || "").replace(/[\s-]/g, "");
     return {
       id: item._id.toString(), accountId: item.accountId, fullName: owner?.fullName || "Member",
       amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod,
