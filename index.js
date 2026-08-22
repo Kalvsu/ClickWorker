@@ -1414,31 +1414,32 @@ app.patch("/api/admin/transactions/:id", requireAuth, requireAdmin, async (req, 
   if (!Number.isFinite(amount) || Math.abs(amount) > 1000000000) return res.status(400).json({ message: "Enter a valid transaction amount." });
   if (!status || status.length > 40 || !/^[a-z0-9_-]+$/.test(status)) return res.status(400).json({ message: "Enter a valid transaction status." });
   if (Number.isNaN(createdAt.getTime())) return res.status(400).json({ message: "Enter a valid transaction date and time." });
-  const session = mongoClient.startSession();
   try {
-    let updated;
-    await session.withTransaction(async () => {
-      const existing = await transactions.findOne({ _id: id }, { session });
-      if (!existing) { const error = new Error("Transaction not found."); error.status = 404; throw error; }
-      const next = { ...existing, amount, status, createdAt };
-      if (description) next.description = description;
-      const balanceAdjustment = Number((transactionCashWalletEffect(next) - transactionCashWalletEffect(existing)).toFixed(2));
-      if (balanceAdjustment) {
-        const userUpdate = await users.updateOne(
-          balanceAdjustment < 0 ? { _id: existing.userId, balance: { $gte: Math.abs(balanceAdjustment) } } : { _id: existing.userId },
-          { $inc: { balance: balanceAdjustment }, $push: { activities: { type: "admin_transaction_correction", title: "Transaction corrected by administrator", amount: balanceAdjustment, points: 0, transactionId: existing._id.toString(), createdAt: new Date() } }, $set: { updatedAt: new Date() } },
-          { session }
-        );
-        if (userUpdate.modifiedCount !== 1) { const error = new Error("The account has insufficient Cash Wallet balance for this transaction change."); error.status = 400; throw error; }
-      }
-      const result = await transactions.findOneAndUpdate({ _id: id }, { $set: { amount, status, createdAt, ...(description ? { description } : {}), editedAt: new Date(), editedBy: req.user._id } }, { returnDocument: "after", session });
-      updated = result;
-    });
+    const existing = await transactions.findOne({ _id: id });
+    if (!existing) return res.status(404).json({ message: "Transaction not found." });
+    const next = { ...existing, amount, status, createdAt };
+    if (description) next.description = description;
+    const balanceAdjustment = Number((transactionCashWalletEffect(next) - transactionCashWalletEffect(existing)).toFixed(2));
+    if (balanceAdjustment) {
+      const userUpdate = await users.updateOne(
+        balanceAdjustment < 0 ? { _id: existing.userId, balance: { $gte: Math.abs(balanceAdjustment) } } : { _id: existing.userId },
+        { $inc: { balance: balanceAdjustment }, $push: { activities: { type: "admin_transaction_correction", title: "Transaction corrected by administrator", amount: balanceAdjustment, points: 0, transactionId: existing._id.toString(), createdAt: new Date() } }, $set: { updatedAt: new Date() } }
+      );
+      if (userUpdate.modifiedCount !== 1) return res.status(400).json({ message: "The account has insufficient Cash Wallet balance for this transaction change." });
+    }
+    const updated = await transactions.findOneAndUpdate({ _id: id }, { $set: { amount, status, createdAt, ...(description ? { description } : {}), editedAt: new Date(), editedBy: req.user._id } }, { returnDocument: "after" });
     return res.json({ message: "Transaction updated.", transaction: { id: updated._id.toString(), type: updated.type, status: updated.status, amount: updated.amount, paymentMethod: updated.paymentMethod || "", description: updated.description || "", createdAt: updated.createdAt } });
   } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not update transaction." }); }
-  finally { await session.endSession(); }
 });
 
+app.delete("/api/admin/transactions/:id", requireAuth, requireAdmin, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid transaction." }); }
+  try {
+    const result = await transactions.deleteOne({ _id: id });
+    if (result.deletedCount !== 1) return res.status(404).json({ message: "Transaction not found." });
+    return res.json({ message: "Transaction details deleted. Cash Wallet balance was not changed." });
+  } catch (error) { return res.status(400).json({ message: error.message || "Could not delete transaction." }); }
+});
 app.patch("/api/admin/users/:accountId/balance", requireAuth, requireAdmin, async (req, res) => {
   const balance = Number(req.body?.balance);
   if (!Number.isFinite(balance) || balance < 0 || balance > 1000000000) return res.status(400).json({ message: "Enter a valid non-negative balance." });
