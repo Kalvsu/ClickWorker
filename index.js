@@ -755,13 +755,23 @@ function isAdministrator(user) {
     ...(Array.isArray(user?.roles) ? user.roles : []),
     ...(Array.isArray(user?.adminRoles) ? user.adminRoles : [])
   ];
-  const administratorRoles = new Set(["admin", "administrator", "superadmin", "superadministrator", "owner"]);
+  const administratorRoles = new Set(["admin", "adminrole", "administrator", "superadmin", "superadministrator", "owner"]);
   return String(user?.accountId || "").trim().toUpperCase() === "ADMIN01"
     || roleValues.some(role => administratorRoles.has(String(role || "").trim().toLowerCase().replace(/[\s_-]+/g, "")));
 }
 
 function requireAdminAccess(req, res, next) {
   return requireAuth(req, res, () => requireAdmin(req, res, next));
+}
+
+function skipRateLimitForAdministrators(req, _res, next) {
+  if (isAdministrator(req.user)) return next();
+  return rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    key: request => String(request.user._id),
+    message: "Too many withdrawal attempts. Please wait and try again."
+  })(req, _res, next);
 }
 
 app.get("/health", (_req, res) => res.json({ ok: Boolean(users) }));
@@ -1868,7 +1878,7 @@ app.post("/api/paymongo/webhook", async (req, res) => {
     return res.status(200).json({ received: true });
   } catch (error) { console.error("paymongo webhook", error); return res.status(500).json({ message: "Webhook processing failed." }); }
 });
-app.post("/api/wallet/withdraw", requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, max: 5, key: req => String(req.user._id), message: "Too many withdrawal attempts. Please wait and try again." }), async (req, res) => {
+app.post("/api/wallet/withdraw", requireAuth, skipRateLimitForAdministrators, async (req, res) => {
   const isAdmin = isAdministrator(req.user);
   const amount = Number(req.body?.amount);
   const withdrawalPassword = String(req.body?.withdrawalPassword || "");
