@@ -704,6 +704,12 @@ function withdrawalScheduleForUser(user, now = manilaWallClock()) {
 }
 
 async function withdrawalStatus(user) {
+  if (user.role === "Admin") return {
+    eligible: true, reason: "Administrator withdrawals are available at any time.",
+    schedule: { label: "Any time", group: "Administrator" }, periodKey: "",
+    nextPeriodAt: null, daysUntilNextPeriod: 0, balance: Number(user.balance || 0),
+    alreadyRequested: false, canWithdraw: Number(user.balance || 0) > 0, adminBypass: true
+  };
   const schedule = withdrawalScheduleForUser(user);
   if (!schedule.schedule) return { ...schedule, balance: Number(user.balance || 0), alreadyRequested: false, canWithdraw: false };
   const existing = schedule.periodKey ? await transactions.findOne({ userId: user._id, type: "withdrawal", scheduleKey: schedule.periodKey }) : null;
@@ -1851,23 +1857,28 @@ app.post("/api/paymongo/webhook", async (req, res) => {
   } catch (error) { console.error("paymongo webhook", error); return res.status(500).json({ message: "Webhook processing failed." }); }
 });
 app.post("/api/wallet/withdraw", requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, max: 5, key: req => String(req.user._id), message: "Too many withdrawal attempts. Please wait and try again." }), async (req, res) => {
+  const isAdmin = req.user.role === "Admin";
   const amount = Number(req.body?.amount);
   const withdrawalPassword = String(req.body?.withdrawalPassword || "");
   if (!Number.isFinite(amount) || !WITHDRAWAL_SUGGESTED_AMOUNTS.includes(amount)) return res.status(400).json({ message: "Select one of the available suggested withdrawal amounts." });
   if (!req.user.withdrawalBank?.accountNumber) return res.status(400).json({ message: "Add one personal bank account before withdrawing." });
   if (!req.user.withdrawalPasswordHash) return res.status(400).json({ message: "Set your withdrawal password first." });
   if (!(await bcrypt.compare(withdrawalPassword, req.user.withdrawalPasswordHash))) return res.status(401).json({ message: "Incorrect withdrawal password." });
-  const schedule = withdrawalScheduleForUser(req.user);
-  if (!schedule.eligible) return res.status(403).json({ message: schedule.reason, withdrawal: await withdrawalStatus(req.user) });
+  const schedule = isAdmin
+    ? { eligible: true, schedule: { label: "Any time", group: "Administrator" }, periodKey: "" }
+    : withdrawalScheduleForUser(req.user);
+  if (!isAdmin && !schedule.eligible) return res.status(403).json({ message: schedule.reason, withdrawal: await withdrawalStatus(req.user) });
   if (amount > Number(req.user.balance || 0)) return res.status(400).json({ message: `Amount cannot exceed your Cash Wallet balance of ₱${Number(req.user.balance || 0).toFixed(2)}.` });
-  const alreadyRequested = await transactions.findOne({ userId: req.user._id, type: "withdrawal", scheduleKey: schedule.periodKey });
-  if (alreadyRequested) return res.status(409).json({ message: "You have already submitted a withdrawal request for this scheduled period." });
+  if (!isAdmin) {
+    const alreadyRequested = await transactions.findOne({ userId: req.user._id, type: "withdrawal", scheduleKey: schedule.periodKey });
+    if (alreadyRequested) return res.status(409).json({ message: "You have already submitted a withdrawal request for this scheduled period." });
+  }
   const now = new Date();
   const signupBonusBalance = Math.max(0, Number(req.user.signupBonusBalance || 0));
   const nonBonusBalance = Math.max(0, Number(req.user.balance || 0) - signupBonusBalance);
   const signupBonusUsed = Math.max(0, amount - nonBonusBalance);
-  if (signupBonusUsed > 0 && schedule.schedule?.day !== 5) return res.status(403).json({ message: "Signup bonus funds can only be withdrawn on Friday, 8:00 AM–6:00 PM Manila time." });
-  const request = { userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumber: String(req.user.withdrawalBank.accountNumber), bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), scheduleKey: schedule.periodKey, scheduledDay: schedule.schedule.label, createdAt: now };
+  if (!isAdmin && signupBonusUsed > 0 && schedule.schedule?.day !== 5) return res.status(403).json({ message: "Signup bonus funds can only be withdrawn on Friday, 8:00 AM–6:00 PM Manila time." });
+  const request = { userId: req.user._id, accountId: req.user.accountId, type: "withdrawal", status: "pending", amount: -amount, paymentMethod: req.user.withdrawalBank.bankName, description: `Withdrawal to ${req.user.withdrawalBank.bankName} (${maskBankAccount(req.user.withdrawalBank.accountNumber)})`, bankAccountName: req.user.withdrawalBank.accountName, bankName: req.user.withdrawalBank.bankName, bankAccountNumber: String(req.user.withdrawalBank.accountNumber), bankAccountNumberMasked: maskBankAccount(req.user.withdrawalBank.accountNumber), ...(isAdmin ? {} : { scheduleKey: schedule.periodKey }), scheduledDay: schedule.schedule.label, createdAt: now };
   const session = mongoClient.startSession();
   try {
     let updated;
@@ -1878,7 +1889,7 @@ app.post("/api/wallet/withdraw", requireAuth, rateLimit({ windowMs: 15 * 60 * 10
       updated = await users.findOneAndUpdate({ _id: req.user._id, balance: { $gte: amount } }, { $inc: increments, $push: { activities: { type: "withdraw", title: "Bank withdrawal request", amount: -amount, points: 0, status: "pending", scheduleKey: schedule.periodKey, createdAt: now } } }, { returnDocument: "after", session });
       if (!updated) { const error = new Error("Insufficient balance."); error.status = 400; throw error; }
     });
-    return res.json({ message: "Withdrawal request submitted for your scheduled period.", user: publicUser(updated) });
+    return res.json({ message: isAdmin ? "Administrator withdrawal request submitted." : "Withdrawal request submitted for your scheduled period.", user: publicUser(updated) });
   } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not submit withdrawal." }); } finally { await session.endSession(); }
 });
 async function gameMemberView(user) {
