@@ -1385,7 +1385,7 @@ app.get("/api/admin/users/:accountId/cashflow", requireAuth, requireAdmin, async
     if (item.type.includes("referral")) sum.referrals += amount;
     return sum;
   }, { topups: 0, withdrawals: 0, referrals: 0 });
-  return res.json({ user: safeUserSummary(user), totals, transactions: items.map(item => ({ id: item._id.toString(), type: item.type, status: item.status, amount: item.amount, paymentMethod: item.paymentMethod || "", description: item.description || "", createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+  return res.json({ user: safeUserSummary(user), totals, transactions: items.map(item => ({ id: item._id.toString(), type: item.type, status: item.status, amount: item.amount, paymentMethod: item.paymentMethod || "", description: item.description || "", createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "", adminAppended: Boolean(item.adminAppended) })) });
 });
 
 function transactionCashWalletEffect(transaction) {
