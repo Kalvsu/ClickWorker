@@ -1129,6 +1129,7 @@ app.get("/api/wallet/withdrawals", requireAuth, async (req, res) => {
   return res.json({ withdrawals: items.map(item => ({
     id: item._id.toString(), status: item.status || "pending", amount: Math.abs(Number(item.amount || 0)),
     paymentMethod: item.paymentMethod || "GCash", description: item.description || "Withdrawal request",
+    bankAccount: { accountName: item.bankAccountName || "", bankName: item.bankName || item.paymentMethod || "", accountNumberMasked: item.bankAccountNumberMasked || maskBankAccount(item.bankAccountNumber || "") },
     createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || ""
   })) });
 });
@@ -1392,7 +1393,52 @@ app.get("/api/admin/withdrawals", requireAuth, requireAdmin, async (_req, res) =
   const accountIds = [...new Set(items.map(item => item.accountId).filter(Boolean))];
   const owners = await users.find({ accountId: { $in: accountIds } }).project({ accountId: 1, fullName: 1 }).toArray();
   const names = new Map(owners.map(item => [item.accountId, item.fullName]));
-  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, bankAccount: { accountName: item.bankAccountName || "", bankName: item.bankName || item.paymentMethod || "", accountNumber: item.bankAccountNumber || "", accountNumberMasked: item.bankAccountNumberMasked || "" }, scheduleKey: item.scheduleKey || "", scheduledDay: item.scheduledDay || "", createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, bankAccount: { accountName: item.bankAccountName || "", bankName: item.bankName || item.paymentMethod || "", accountNumber: item.bankAccountNumber || "", accountNumberMasked: item.bankAccountNumberMasked || maskBankAccount(item.bankAccountNumber || "") }, scheduleKey: item.scheduleKey || "", scheduledDay: item.scheduledDay || "", adminAppended: Boolean(item.adminAppended), createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+});
+
+app.post("/api/admin/withdrawals/manual", requireAuth, requireAdmin, async (req, res) => {
+  const accountId = String(req.body?.accountId || "").trim().replace(/^CW/i, "");
+  const amount = Number(req.body?.amount);
+  const status = String(req.body?.status || "pending").trim().toLowerCase();
+  const createdAt = new Date(req.body?.createdAt);
+  const description = String(req.body?.description || "Withdrawal transaction added by administrator").trim().slice(0, 500);
+  if (!accountId) return res.status(400).json({ message: "Enter a user account ID." });
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000000) return res.status(400).json({ message: "Enter a valid withdrawal amount greater than zero." });
+  if (!["pending", "completed", "rejected"].includes(status)) return res.status(400).json({ message: "Status must be pending, completed, or rejected." });
+  if (Number.isNaN(createdAt.getTime())) return res.status(400).json({ message: "Enter a valid transaction date and time." });
+  const user = await users.findOne({ accountId });
+  if (!user) return res.status(404).json({ message: "User account ID not found." });
+  if (user.role === "Admin") return res.status(403).json({ message: "A withdrawal cannot be appended to an administrator account." });
+  const bank = user.withdrawalBank || {};
+  const item = {
+    userId: user._id, accountId: user.accountId, type: "withdrawal", status, amount: -amount,
+    paymentMethod: bank.bankName || "Bank transfer", description: description || "Withdrawal transaction added by administrator",
+    bankAccountName: bank.accountName || "", bankName: bank.bankName || "", bankAccountNumber: String(bank.accountNumber || ""),
+    bankAccountNumberMasked: maskBankAccount(bank.accountNumber || ""), adminAppended: true,
+    appendedBy: req.user._id, appendedAt: new Date(), createdAt,
+    reviewedAt: status === "pending" ? null : createdAt, reviewedBy: status === "pending" ? null : req.user._id
+  };
+  const result = await transactions.insertOne(item);
+  return res.status(201).json({ message: `Withdrawal transaction added to account ${user.accountId}.`, id: result.insertedId.toString() });
+});
+
+app.patch("/api/admin/withdrawals/:id/manual", requireAuth, requireAdmin, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid withdrawal." }); }
+  const amount = Number(req.body?.amount);
+  const status = String(req.body?.status || "").trim().toLowerCase();
+  const createdAt = new Date(req.body?.createdAt);
+  const description = String(req.body?.description || "Withdrawal transaction added by administrator").trim().slice(0, 500);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000000) return res.status(400).json({ message: "Enter a valid withdrawal amount greater than zero." });
+  if (!["pending", "completed", "rejected"].includes(status)) return res.status(400).json({ message: "Status must be pending, completed, or rejected." });
+  if (Number.isNaN(createdAt.getTime())) return res.status(400).json({ message: "Enter a valid transaction date and time." });
+  const existing = await transactions.findOne({ _id: id, type: "withdrawal", adminAppended: true });
+  if (!existing) return res.status(404).json({ message: "Custom withdrawal transaction not found." });
+  await transactions.updateOne({ _id: id, type: "withdrawal", adminAppended: true }, { $set: {
+    amount: -amount, status, createdAt, description: description || "Withdrawal transaction added by administrator",
+    reviewedAt: status === "pending" ? null : new Date(), reviewedBy: status === "pending" ? null : req.user._id,
+    editedAt: new Date(), editedBy: req.user._id, rejectionReason: ""
+  } });
+  return res.json({ message: "Custom withdrawal transaction updated." });
 });
 
 app.patch("/api/admin/withdrawals/:id", requireAuth, requireAdmin, async (req, res) => {
