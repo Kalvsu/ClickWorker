@@ -1192,30 +1192,38 @@ app.get("/api/wallet/withdrawals", requireAuth, async (req, res) => {
   })) });
 });
 
-app.get("/api/account/analytics", requireAuth, async (req, res) => {
-  const now = new Date();
+function analyticsDateKey(value = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(value).reduce((map, part) => { if (part.type !== "literal") map[part.type] = part.value; return map; }, {});
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+function calculatePointAnalytics(user, now = new Date()) {
   const startOfToday = new Date(now); startOfToday.setHours(0, 0, 0, 0);
   const startOfYesterday = new Date(startOfToday); startOfYesterday.setDate(startOfYesterday.getDate() - 1);
   const startOfWeek = new Date(startOfToday); startOfWeek.setDate(startOfWeek.getDate() - 6);
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const activities = Array.isArray(req.user.activities) ? req.user.activities : [];
+  const activities = Array.isArray(user.activities) ? user.activities : [];
   const sumPoints = (from, to = null) => activities.reduce((sum, item) => {
     const createdAt = new Date(item.createdAt || 0);
     return createdAt >= from && (!to || createdAt < to) ? sum + Number(item.points || 0) : sum;
   }, 0);
-  const totalPointsEarned = activities.reduce((sum, item) => sum + Math.max(0, Number(item.points || 0)), 0);
+  const computedTotalPointsEarned = activities.reduce((sum, item) => sum + Math.max(0, Number(item.points || 0)), 0);
+  const overrides = user.analyticsProfitOverrides || {};
+  const todayOverride = overrides.todayDate === analyticsDateKey(now) && Number.isFinite(Number(overrides.todayPoints)) ? Number(overrides.todayPoints) : null;
+  const totalOverride = Number.isFinite(Number(overrides.totalPointsEarned)) ? Number(overrides.totalPointsEarned) : null;
+  const todayPoints = todayOverride === null ? sumPoints(startOfToday) : todayOverride;
+  const totalPointsEarned = totalOverride === null ? computedTotalPointsEarned : totalOverride;
   const completedTasks = activities.filter(item => Number(item.points || 0) > 0).length;
+  return { todayPoints, yesterdayPoints: sumPoints(startOfYesterday, startOfToday), weekPoints: sumPoints(startOfWeek), monthPoints: sumPoints(startOfMonth), totalPointsEarned, completedTasks };
+}
+
+app.get("/api/account/analytics", requireAuth, async (req, res) => {
+  const pointAnalytics = calculatePointAnalytics(req.user);
   const deposits = await transactions.aggregate([
     { $match: { userId: req.user._id, type: "topup", status: "completed" } },
     { $group: { _id: null, total: { $sum: "$amount" } } }
   ]).toArray();
   return res.json({ analytics: {
-    todayPoints: sumPoints(startOfToday),
-    yesterdayPoints: sumPoints(startOfYesterday, startOfToday),
-    weekPoints: sumPoints(startOfWeek),
-    monthPoints: sumPoints(startOfMonth),
-    totalPointsEarned,
-    completedTasks,
+    ...pointAnalytics,
     walletBalance: Number(req.user.balance || 0),
     totalDeposits: Number(deposits[0]?.total || 0)
   }});
@@ -1402,6 +1410,26 @@ app.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const match = query ? { $or: [{ accountId }, { usernameLower: query.toLowerCase() }, { username: { $regex: escapedQuery, $options: "i" } }, { fullName: { $regex: escapedQuery, $options: "i" } }, ...(phoneQuery ? [{ phone: { $regex: phoneQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") } }] : [])] } : {};
   const items = await users.find(match).sort({ createdAt: -1 }).limit(200).toArray();
   return res.json({ users: items.map(safeUserSummary) });
+});
+
+app.get("/api/admin/users/:accountId/analytics", requireAuth, requireAdmin, async (req, res) => {
+  const user = await users.findOne({ accountId: String(req.params.accountId) });
+  if (!user) return res.status(404).json({ message: "Account not found." });
+  return res.json({ accountId: user.accountId, analytics: calculatePointAnalytics(user), overrides: user.analyticsProfitOverrides || null });
+});
+
+app.patch("/api/admin/users/:accountId/analytics", requireAuth, requireAdmin, async (req, res) => {
+  const totalPointsEarned = Number(req.body?.totalPointsEarned);
+  const todayPoints = Number(req.body?.todayPoints);
+  if (!Number.isFinite(totalPointsEarned) || Math.abs(totalPointsEarned) > 1000000000 || !Number.isFinite(todayPoints) || Math.abs(todayPoints) > 1000000000) return res.status(400).json({ message: "Enter valid profit values." });
+  const now = new Date();
+  const updated = await users.findOneAndUpdate(
+    { accountId: String(req.params.accountId) },
+    { $set: { analyticsProfitOverrides: { totalPointsEarned, todayPoints, todayDate: analyticsDateKey(now), updatedAt: now, updatedBy: req.user._id }, updatedAt: now } },
+    { returnDocument: "after" }
+  );
+  if (!updated) return res.status(404).json({ message: "Account not found." });
+  return res.json({ message: "User profit analytics updated.", analytics: calculatePointAnalytics(updated) });
 });
 
 app.get("/api/admin/users/:accountId/cashflow", requireAuth, requireAdmin, async (req, res) => {
