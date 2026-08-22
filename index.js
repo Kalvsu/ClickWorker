@@ -2029,11 +2029,12 @@ async function ensureGameInviteNotification(invite) {
 app.get("/api/games/weekly", requireAuth, async (req, res) => res.json(await gameMemberView(req.user)));
 app.get("/api/games/mystery-vault", requireAuth, async (req, res) => {
   const user = await users.findOne({ _id: req.user._id }, { projection: { mysteryVaultTickets: 1, mysteryVaultPlayedAt: 1, mysteryVaultReward: 1 } });
+  const tickets = Number(user?.mysteryVaultTickets || 0);
   return res.json({
     vault: {
-      available: !user?.mysteryVaultPlayedAt && Number(user?.mysteryVaultTickets || 0) > 0,
-      played: Boolean(user?.mysteryVaultPlayedAt),
-      tickets: Number(user?.mysteryVaultTickets || 0),
+      available: tickets > 0,
+      played: Boolean(user?.mysteryVaultPlayedAt) && tickets <= 0,
+      tickets,
       commonReward: MYSTERY_VAULT_COMMON_REWARD,
       revealedVault: user?.mysteryVaultPlayedAt ? Number(user?.mysteryVaultReward?.vault || 0) : null,
       reward: user?.mysteryVaultPlayedAt ? Number(user?.mysteryVaultReward?.amount || MYSTERY_VAULT_COMMON_REWARD) : null
@@ -2046,11 +2047,11 @@ app.post("/api/games/mystery-vault/pick", requireAuth, actionRateLimit, async (r
   const now = new Date();
   const reward = MYSTERY_VAULT_COMMON_REWARD;
   const updated = await users.findOneAndUpdate(
-    { _id: req.user._id, mysteryVaultPlayedAt: { $exists: false }, mysteryVaultTickets: { $gte: 1 } },
-    { $inc: { mysteryVaultTickets: -1, balance: reward }, $set: { mysteryVaultPlayedAt: now, mysteryVaultReward: { vault, amount: reward, tier: "common", awardedAt: now } }, $push: { activities: { type: "mystery_vault_reward", title: "Mystery Vault common reward", points: 0, amount: reward, vault, createdAt: now } } },
+    { _id: req.user._id, mysteryVaultTickets: { $gte: 1 } },
+    { $inc: { mysteryVaultTickets: -1, mysteryVaultPickCount: 1, balance: reward }, $set: { mysteryVaultPlayedAt: now, mysteryVaultReward: { vault, amount: reward, tier: "common", awardedAt: now } }, $push: { activities: { type: "mystery_vault_reward", title: "Mystery Vault common reward", points: 0, amount: reward, vault, createdAt: now } } },
     { returnDocument: "after" }
   );
-  if (!updated) return res.status(409).json({ message: "You have already made your Mystery Vault pick or do not have a ticket." });
+  if (!updated) return res.status(409).json({ message: "You do not have a Mystery Vault ticket." });
   try { await vaultPicks.insertOne({ userId: updated._id, accountId: updated.accountId, vault, reward, tier: "common", createdAt: now }); } catch (error) { console.error("mystery vault audit", error); }
   return res.json({ message: `Vault ${vault} revealed a ₱${reward.toFixed(2)} common reward in your Cash Wallet.`, reward, vault, user: publicUser(updated) });
 });
@@ -2222,7 +2223,8 @@ async function start() {
   await gameXpEvents.createIndex({ deploymentId: 1, userId: 1, sourceId: 1 }, { unique: true });
   await gameRewards.createIndex({ rewardId: 1 }, { unique: true });
   await gameRewards.createIndex({ userId: 1, createdAt: -1 });
-  await vaultPicks.createIndex({ userId: 1 }, { unique: true });
+  await vaultPicks.dropIndex("userId_1").catch(() => {});
+  await vaultPicks.createIndex({ userId: 1, createdAt: -1 });
   // Backfill tickets for referrals who bought a Worker before Mystery Vault
   // launched. The per-member claim marker makes this safe on every restart.
   const eligibleVaultReferrals = await users.find({ invitedByUserId: { $ne: null }, activeWorker: { $gte: 1 }, mysteryVaultReferralTicketAwardedAt: { $exists: false } }).project({ _id: 1, accountId: 1, invitedByUserId: 1, activeWorker: 1 }).toArray();
