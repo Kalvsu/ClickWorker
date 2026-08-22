@@ -704,7 +704,7 @@ function withdrawalScheduleForUser(user, now = manilaWallClock()) {
 }
 
 async function withdrawalStatus(user) {
-  if (user.role === "Admin") return {
+  if (isAdministrator(user)) return {
     eligible: true, reason: "Administrator withdrawals are available at any time.",
     schedule: { label: "Any time", group: "Administrator" }, periodKey: "",
     nextPeriodAt: null, daysUntilNextPeriod: 0, balance: Number(user.balance || 0),
@@ -742,10 +742,14 @@ async function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (String(req.user?.role || "").toLowerCase() !== "admin") {
+  if (!isAdministrator(req.user)) {
     return res.status(403).json({ message: "Administrator access required." });
   }
   next();
+}
+
+function isAdministrator(user) {
+  return ["admin", "administrator"].includes(String(user?.role || "").trim().toLowerCase());
 }
 
 function requireAdminAccess(req, res, next) {
@@ -1857,7 +1861,7 @@ app.post("/api/paymongo/webhook", async (req, res) => {
   } catch (error) { console.error("paymongo webhook", error); return res.status(500).json({ message: "Webhook processing failed." }); }
 });
 app.post("/api/wallet/withdraw", requireAuth, rateLimit({ windowMs: 15 * 60 * 1000, max: 5, key: req => String(req.user._id), message: "Too many withdrawal attempts. Please wait and try again." }), async (req, res) => {
-  const isAdmin = req.user.role === "Admin";
+  const isAdmin = isAdministrator(req.user);
   const amount = Number(req.body?.amount);
   const withdrawalPassword = String(req.body?.withdrawalPassword || "");
   if (!Number.isFinite(amount) || !WITHDRAWAL_SUGGESTED_AMOUNTS.includes(amount)) return res.status(400).json({ message: "Select one of the available suggested withdrawal amounts." });
