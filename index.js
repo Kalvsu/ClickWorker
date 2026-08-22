@@ -647,6 +647,7 @@ function publicUser(user) {
     activeWorker: Number(user.activeWorker || 0),
     tasksUnlocked: Number(user.activeWorker || 0) > 0,
     role: user.role || "Member",
+    isAdmin: isAdministrator(user),
     memberSince: user.createdAt,
     membershipStartedAt: user.workerPurchasedAt || null,
     membershipExpiresAt: user.membershipExpiresAt || null,
@@ -749,8 +750,14 @@ function requireAdmin(req, res, next) {
 }
 
 function isAdministrator(user) {
-  return ["admin", "administrator"].includes(String(user?.role || "").trim().toLowerCase())
-    || String(user?.accountId || "").trim().toUpperCase() === "ADMIN01";
+  const roleValues = [
+    user?.role,
+    ...(Array.isArray(user?.roles) ? user.roles : []),
+    ...(Array.isArray(user?.adminRoles) ? user.adminRoles : [])
+  ];
+  const administratorRoles = new Set(["admin", "administrator", "superadmin", "superadministrator", "owner"]);
+  return String(user?.accountId || "").trim().toUpperCase() === "ADMIN01"
+    || roleValues.some(role => administratorRoles.has(String(role || "").trim().toLowerCase().replace(/[\s_-]+/g, "")));
 }
 
 function requireAdminAccess(req, res, next) {
