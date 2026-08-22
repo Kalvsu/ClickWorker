@@ -338,6 +338,7 @@ let gameInvites;
 let gameScores;
 let gameXpEvents;
 let gameRewards;
+let vaultPicks;
 let rateLimits;
 let signupAttempts;
 let mongoClient;
@@ -347,6 +348,8 @@ const WORKER_AGREEMENT_VERSION = "clickworker-rules-v1";
 const PAYMONGO_CHECKOUT_URL = "https://api.paymongo.com/v1/checkout_sessions";
 const PAYMONGO_CURRENCY = "PHP";
 const WITHDRAWAL_SUGGESTED_AMOUNTS = [15, 150, 600, 1500, 4000, 10000, 30000, 100000, 250000, 700000, 2000000];
+const MYSTERY_VAULT_COMMON_REWARD = 10;
+const WEEKLY_TEAM_GAME_AVAILABLE = false;
 
 const adminPhone = normalizePhone(process.env.ADMIN_PHONE || "9990000000");
 const adminPassword = process.env.ADMIN_PASSWORD;
@@ -362,10 +365,16 @@ function publicGameConfig(game, admin = false) {
 async function currentGameConfig(includeDraft = false) {
   const game = await gameConfigs.findOne({ key: "weekly" });
   if (!game) return null;
-  if (!includeDraft && game.status !== "active" && game.status !== "completed") return null;
+  if (!includeDraft && (!WEEKLY_TEAM_GAME_AVAILABLE || game.status !== "active")) return null;
   return game;
 }
+async function activeWeeklyGame() {
+  if (!WEEKLY_TEAM_GAME_AVAILABLE) return null;
+  const now = new Date();
+  return gameConfigs.findOne({ key: "weekly", status: "active", startAt: { $lte: now }, endAt: { $gt: now } });
+}
 async function awardWeeklyGameXp(user, sourceId, sourceTitle, session) {
+  if (!WEEKLY_TEAM_GAME_AVAILABLE) return 0;
   const now = new Date();
   const game = await gameConfigs.findOne({ key: "weekly", status: "active", startAt: { $lte: now }, endAt: { $gt: now } }, { session });
   if (!game?.deploymentId) return 0;
@@ -380,6 +389,7 @@ async function awardWeeklyGameXp(user, sourceId, sourceTitle, session) {
   return xp;
 }
 async function settleWeeklyGame() {
+  if (!WEEKLY_TEAM_GAME_AVAILABLE) return;
   const now = new Date();
   const game = await gameConfigs.findOne({ key: "weekly", status: { $in: ["active", "settling"] }, endAt: { $lte: now } });
   if (!game?.deploymentId) return;
@@ -648,6 +658,8 @@ function publicUser(user) {
     tasksUnlocked: Number(user.activeWorker || 0) > 0,
     role: user.role || "Member",
     isAdmin: isAdministrator(user),
+    mysteryVaultTickets: Number(user.mysteryVaultTickets || 0),
+    mysteryVaultPlayed: Boolean(user.mysteryVaultPlayedAt),
     memberSince: user.createdAt,
     membershipStartedAt: user.workerPurchasedAt || null,
     membershipExpiresAt: user.membershipExpiresAt || null,
@@ -851,17 +863,24 @@ app.post("/api/auth/register", authRateLimit, async (req, res) => {
       points: 0,
       balance: 15,
       signupBonusBalance: 15,
+      mysteryVaultTickets: 1,
       membershipLevel: "No active membership",
       activeWorker: 0,
       role: "Member",
       guidanceAcceptedAt: null,
-      activities: [{ type: "signup_bonus", title: "Signup bonus", points: 0, amount: 15, createdAt: new Date() }, { type: "account", title: "Account created", points: 0, amount: 0, createdAt: new Date() }],
+      activities: [{ type: "signup_bonus", title: "Signup bonus", points: 0, amount: 15, createdAt: new Date() }, { type: "mystery_vault_ticket", title: "Mystery Vault welcome ticket", points: 0, amount: 0, tickets: 1, createdAt: new Date() }, { type: "account", title: "Account created", points: 0, amount: 0, createdAt: new Date() }],
       createdAt: new Date()
     };
     const result = await users.insertOne(user);
     user._id = result.insertedId;
     if (registrationSmsRequired) await signupAttempts.updateOne({ phone: normalizedPhone }, { $set: { status: "used", usedAt: new Date(), expiresAt: new Date() } });
-    if (inviter) await users.updateOne({ _id: inviter._id }, { $inc: { referralCount: 1 } });
+    if (inviter) {
+      const ticketReward = Math.max(0, Math.floor(Number(inviter.activeWorker || 0)));
+      await users.updateOne({ _id: inviter._id }, {
+        $inc: { referralCount: 1, mysteryVaultTickets: ticketReward },
+        ...(ticketReward ? { $push: { activities: { type: "mystery_vault_referral_ticket", title: `Mystery Vault referral tickets from ${accountId}`, points: 0, amount: 0, tickets: ticketReward, sourceAccountId: accountId, createdAt: new Date() } } } : {})
+      });
+    }
     await notifications.insertOne({
       userId: user._id,
       accountId: user.accountId,
@@ -1996,6 +2015,33 @@ async function ensureGameInviteNotification(invite) {
 }
 
 app.get("/api/games/weekly", requireAuth, async (req, res) => res.json(await gameMemberView(req.user)));
+app.get("/api/games/mystery-vault", requireAuth, async (req, res) => {
+  const user = await users.findOne({ _id: req.user._id }, { projection: { mysteryVaultTickets: 1, mysteryVaultPlayedAt: 1, mysteryVaultReward: 1 } });
+  return res.json({
+    vault: {
+      available: !user?.mysteryVaultPlayedAt && Number(user?.mysteryVaultTickets || 0) > 0,
+      played: Boolean(user?.mysteryVaultPlayedAt),
+      tickets: Number(user?.mysteryVaultTickets || 0),
+      commonReward: MYSTERY_VAULT_COMMON_REWARD,
+      revealedVault: user?.mysteryVaultPlayedAt ? Number(user?.mysteryVaultReward?.vault || 0) : null,
+      reward: user?.mysteryVaultPlayedAt ? Number(user?.mysteryVaultReward?.amount || MYSTERY_VAULT_COMMON_REWARD) : null
+    }
+  });
+});
+app.post("/api/games/mystery-vault/pick", requireAuth, actionRateLimit, async (req, res) => {
+  const vault = Math.floor(Number(req.body?.vault));
+  if (!Number.isInteger(vault) || vault < 1 || vault > 9) return res.status(400).json({ message: "Choose one vault from 1 to 9." });
+  const now = new Date();
+  const reward = MYSTERY_VAULT_COMMON_REWARD;
+  const updated = await users.findOneAndUpdate(
+    { _id: req.user._id, mysteryVaultPlayedAt: { $exists: false }, mysteryVaultTickets: { $gte: 1 } },
+    { $inc: { mysteryVaultTickets: -1, balance: reward }, $set: { mysteryVaultPlayedAt: now, mysteryVaultReward: { vault, amount: reward, tier: "common", awardedAt: now } }, $push: { activities: { type: "mystery_vault_reward", title: "Mystery Vault common reward", points: 0, amount: reward, vault, createdAt: now } } },
+    { returnDocument: "after" }
+  );
+  if (!updated) return res.status(409).json({ message: "You have already made your Mystery Vault pick or do not have a ticket." });
+  try { await vaultPicks.insertOne({ userId: updated._id, accountId: updated.accountId, vault, reward, tier: "common", createdAt: now }); } catch (error) { console.error("mystery vault audit", error); }
+  return res.json({ message: `Vault ${vault} revealed a ₱${reward.toFixed(2)} common reward in your Cash Wallet.`, reward, vault, user: publicUser(updated) });
+});
 app.get("/api/games/teams/:id/members", requireAuth, async (req, res) => {
   let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid team." }); }
   const team = await gameTeams.findOne({ _id: id, memberIds: req.user._id });
@@ -2006,6 +2052,7 @@ app.get("/api/games/teams/:id/members", requireAuth, async (req, res) => {
   return res.json({ team: { id: team._id.toString(), name: team.name, memberCount: team.memberIds.length }, members: rows.slice(0, 100) });
 });
 app.post("/api/games/teams", requireAuth, async (req, res) => {
+  if (!(await activeWeeklyGame())) return res.status(409).json({ message: "Weekly Team Challenge is unavailable for now." });
   if (await gameTeams.findOne({ memberIds: req.user._id })) return res.status(409).json({ message: "You can create or join only one team." });
   const name = String(req.body?.name || "").trim().replace(/\s+/g, " ");
   if (name.length < 3 || name.length > 40) return res.status(400).json({ message: "Team name must contain 3 to 40 characters." });
@@ -2014,6 +2061,7 @@ app.post("/api/games/teams", requireAuth, async (req, res) => {
   return res.status(201).json({ message: "Team created.", ...(await gameMemberView(req.user)) });
 });
 app.post("/api/games/teams/invite", requireAuth, async (req, res) => {
+  if (!(await activeWeeklyGame())) return res.status(409).json({ message: "Weekly Team Challenge is unavailable for now." });
   const team = await gameTeams.findOne({ ownerId: req.user._id });
   if (!team) return res.status(403).json({ message: "Only the team creator can invite members." });
   const game = await currentGameConfig(true); const maxTeamSize = Math.min(10, Number(game?.maxTeamSize || 10));
@@ -2036,6 +2084,7 @@ app.post("/api/games/teams/invite", requireAuth, async (req, res) => {
   return res.status(201).json({ message: `Invitation sent to ${invitee.accountId}.` });
 });
 app.post("/api/games/invitations/:id/respond", requireAuth, async (req, res) => {
+  if (!(await activeWeeklyGame())) return res.status(409).json({ message: "Weekly Team Challenge is unavailable for now." });
   let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid invitation." }); }
   const decision = String(req.body?.decision || "").toLowerCase();
   if (!['accept', 'decline'].includes(decision)) return res.status(400).json({ message: "Choose accept or decline." });
@@ -2081,6 +2130,20 @@ app.post("/api/admin/games/weekly/end", requireAuth, requireAdmin, async (_req, 
   return res.json({ message: "Weekly game ended and rewards were settled.", game: publicGameConfig(await currentGameConfig(true), true) });
 });
 
+app.post("/api/admin/games/weekly/terminate", requireAuth, requireAdmin, async (_req, res) => {
+  const active = await gameConfigs.findOne({ key: "weekly", status: { $in: ["active", "draft", "settling"] } });
+  if (!active) return res.status(409).json({ message: "No weekly game is available to terminate." });
+  const now = new Date();
+  await Promise.all([
+    gameConfigs.deleteOne({ _id: active._id }),
+    gameInvites.deleteMany({}),
+    gameTeams.deleteMany({}),
+    gameScores.deleteMany({ deploymentId: active.deploymentId }),
+    gameXpEvents.deleteMany({ deploymentId: active.deploymentId })
+  ]);
+  return res.json({ message: "Weekly game terminated. No winners were selected and no balances or points were changed." });
+});
+
 async function start() {
   mongoClient = new MongoClient(mongoUri);
   await mongoClient.connect();
@@ -2105,6 +2168,7 @@ async function start() {
   gameScores = db.collection("game_scores");
   gameXpEvents = db.collection("game_xp_events");
   gameRewards = db.collection("game_rewards");
+  vaultPicks = db.collection("mystery_vault_picks");
   rateLimits = db.collection("rate_limits");
   signupAttempts = db.collection("signup_attempts");
   await users.createIndex({ phone: 1 }, { unique: true });
@@ -2146,6 +2210,7 @@ async function start() {
   await gameXpEvents.createIndex({ deploymentId: 1, userId: 1, sourceId: 1 }, { unique: true });
   await gameRewards.createIndex({ rewardId: 1 }, { unique: true });
   await gameRewards.createIndex({ userId: 1, createdAt: -1 });
+  await vaultPicks.createIndex({ userId: 1 }, { unique: true });
   await rateLimits.createIndex({ resetAt: 1 }, { expireAfterSeconds: 0 });
   await signupAttempts.createIndex({ phone: 1 }, { unique: true });
   await signupAttempts.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
