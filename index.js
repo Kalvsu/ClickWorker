@@ -1385,7 +1385,58 @@ app.get("/api/admin/users/:accountId/cashflow", requireAuth, requireAdmin, async
     if (item.type.includes("referral")) sum.referrals += amount;
     return sum;
   }, { topups: 0, withdrawals: 0, referrals: 0 });
-  return res.json({ user: safeUserSummary(user), totals, transactions: items.map(item => ({ id: item._id.toString(), type: item.type, status: item.status, amount: item.amount, description: item.description, createdAt: item.createdAt })) });
+  return res.json({ user: safeUserSummary(user), totals, transactions: items.map(item => ({ id: item._id.toString(), type: item.type, status: item.status, amount: item.amount, paymentMethod: item.paymentMethod || "", description: item.description || "", createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+});
+
+function transactionCashWalletEffect(transaction) {
+  const amount = Number(transaction?.amount || 0);
+  const status = String(transaction?.status || "").toLowerCase();
+  switch (String(transaction?.type || "")) {
+    case "withdrawal": return status === "rejected" ? 0 : -Math.abs(amount);
+    case "worker_application": return status === "completed" ? -Math.abs(amount) : 0;
+    case "commission_order": return status === "locked" ? -Math.abs(amount) : 0;
+    case "topup":
+    case "earnings_conversion":
+    case "commission_transfer":
+    case "referral_starter_bonus":
+    case "referral_bonus":
+    case "admin_balance_adjustment": return status === "completed" ? amount : 0;
+    default: return 0;
+  }
+}
+
+app.patch("/api/admin/transactions/:id", requireAuth, requireAdmin, async (req, res) => {
+  let id; try { id = new ObjectId(req.params.id); } catch (_) { return res.status(400).json({ message: "Invalid transaction." }); }
+  const amount = Number(req.body?.amount);
+  const status = String(req.body?.status || "").trim().toLowerCase();
+  const createdAt = new Date(req.body?.createdAt);
+  const description = String(req.body?.description || "").trim().slice(0, 500);
+  if (!Number.isFinite(amount) || Math.abs(amount) > 1000000000) return res.status(400).json({ message: "Enter a valid transaction amount." });
+  if (!status || status.length > 40 || !/^[a-z0-9_-]+$/.test(status)) return res.status(400).json({ message: "Enter a valid transaction status." });
+  if (Number.isNaN(createdAt.getTime())) return res.status(400).json({ message: "Enter a valid transaction date and time." });
+  const session = mongoClient.startSession();
+  try {
+    let updated;
+    await session.withTransaction(async () => {
+      const existing = await transactions.findOne({ _id: id }, { session });
+      if (!existing) { const error = new Error("Transaction not found."); error.status = 404; throw error; }
+      const next = { ...existing, amount, status, createdAt };
+      if (description) next.description = description;
+      const balanceAdjustment = Number((transactionCashWalletEffect(next) - transactionCashWalletEffect(existing)).toFixed(2));
+      if (balanceAdjustment) {
+        const userUpdate = await users.updateOne(
+          balanceAdjustment < 0 ? { _id: existing.userId, balance: { $gte: Math.abs(balanceAdjustment) } } : { _id: existing.userId },
+          { $inc: { balance: balanceAdjustment }, $push: { activities: { type: "admin_transaction_correction", title: "Transaction corrected by administrator", amount: balanceAdjustment, points: 0, transactionId: existing._id.toString(), createdAt: new Date() } }, $set: { updatedAt: new Date() } },
+          { session }
+        );
+        if (userUpdate.modifiedCount !== 1) { const error = new Error("The account has insufficient Cash Wallet balance for this transaction change."); error.status = 400; throw error; }
+      }
+      const result = await transactions.findOneAndUpdate({ _id: id }, { $set: { amount, status, createdAt, ...(description ? { description } : {}), editedAt: new Date(), editedBy: req.user._id } }, { returnDocument: "after", session });
+      updated = result;
+    });
+    return res.json({ message: "Transaction updated.", transaction: { id: updated._id.toString(), type: updated.type, status: updated.status, amount: updated.amount, paymentMethod: updated.paymentMethod || "", description: updated.description || "", createdAt: updated.createdAt } });
+  } catch (error) { return res.status(error.status || 400).json({ message: error.message || "Could not update transaction." }); }
+  finally { await session.endSession(); }
 });
 
 app.patch("/api/admin/users/:accountId/balance", requireAuth, requireAdmin, async (req, res) => {
