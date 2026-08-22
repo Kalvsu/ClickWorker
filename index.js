@@ -1391,9 +1391,28 @@ app.patch("/api/admin/users/:accountId/access", requireAuth, requireAdmin, async
 app.get("/api/admin/withdrawals", requireAuth, requireAdmin, async (_req, res) => {
   const items = await transactions.find({ type: "withdrawal" }).sort({ createdAt: -1 }).limit(200).toArray();
   const accountIds = [...new Set(items.map(item => item.accountId).filter(Boolean))];
-  const owners = await users.find({ accountId: { $in: accountIds } }).project({ accountId: 1, fullName: 1 }).toArray();
-  const names = new Map(owners.map(item => [item.accountId, item.fullName]));
-  return res.json({ withdrawals: items.map(item => ({ id: item._id.toString(), accountId: item.accountId, fullName: names.get(item.accountId) || "Member", amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod, description: item.description, bankAccount: { accountName: item.bankAccountName || "", bankName: item.bankName || item.paymentMethod || "", accountNumber: item.bankAccountNumber || "", accountNumberMasked: item.bankAccountNumberMasked || maskBankAccount(item.bankAccountNumber || "") }, scheduleKey: item.scheduleKey || "", scheduledDay: item.scheduledDay || "", adminAppended: Boolean(item.adminAppended), createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || "" })) });
+  const owners = await users.find({ accountId: { $in: accountIds } }).project({ accountId: 1, fullName: 1, withdrawalBank: 1 }).toArray();
+  const ownersByAccountId = new Map(owners.map(item => [item.accountId, item]));
+  return res.json({ withdrawals: items.map(item => {
+    const owner = ownersByAccountId.get(item.accountId);
+    // Older transactions did not snapshot the bank details. In the admin-only
+    // payout list, use the member's currently linked account so it remains payable.
+    const fallbackBank = owner?.withdrawalBank || {};
+    const accountNumber = item.bankAccountNumber || String(fallbackBank.accountNumber || "");
+    return {
+      id: item._id.toString(), accountId: item.accountId, fullName: owner?.fullName || "Member",
+      amount: Math.abs(Number(item.amount || 0)), status: item.status, paymentMethod: item.paymentMethod,
+      description: item.description,
+      bankAccount: {
+        accountName: item.bankAccountName || fallbackBank.accountName || "",
+        bankName: item.bankName || fallbackBank.bankName || item.paymentMethod || "",
+        accountNumber,
+        accountNumberMasked: item.bankAccountNumberMasked || maskBankAccount(accountNumber)
+      },
+      scheduleKey: item.scheduleKey || "", scheduledDay: item.scheduledDay || "", adminAppended: Boolean(item.adminAppended),
+      createdAt: item.createdAt, reviewedAt: item.reviewedAt || null, rejectionReason: item.rejectionReason || ""
+    };
+  }) });
 });
 
 app.post("/api/admin/withdrawals/manual", requireAuth, requireAdmin, async (req, res) => {
